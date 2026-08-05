@@ -335,7 +335,7 @@ See [`CHANGELOG.md`](CHANGELOG.md).
 - Chris Manton — original driver;
 - Lars de Bruin — packet-decoding contributions;
 - John E.P. Hynes / HyTronix — upstream maintenance and USB fixes;
-- GP variant — USB hardening, JSONL diagnostics, and protocol-stream resynchronization.
+- Gianpaolo P. / pgpaolo - variant — USB hardening, JSONL diagnostics, and protocol-stream resynchronization.
 
 ## License and redistribution
 
