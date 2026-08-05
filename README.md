@@ -339,7 +339,7 @@ See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License and redistribution
 
-The source code preserves the original copyright headers and refers to a `LICENSE.txt` file. Before publishing or redistributing this fork, include the applicable license file from the original project. Publishing source code without an applicable license does not automatically grant modification or redistribution rights.
+
 
 ## Disclaimer
 
