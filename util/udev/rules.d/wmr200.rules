@@ -1,0 +1,2 @@
+# make the oregon scientific wmr200 connected via usb accessible to non-root, disable USB autosuspend
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fde", ATTRS{idProduct}=="ca01", MODE="0666", ATTR{power/control}="on"
