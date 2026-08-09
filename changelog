@@ -1,1 +1,8 @@
-The project changelog is maintained in CHANGELOG.md.
+3.5.4-gp8-archive-trace
+- Baseline: 3.5.4-gp7-streamresync.
+- Preserved gp7 USB timeout/EPIPE/reopen/stream-resync behavior.
+- Added structured startup archive recovery tracing and gap accounting.
+- Added duplicate/out-of-order archive diagnostics and final recovery summary.
+- Sub-minute archive anomalies are dropped without aborting recovery.
+- Added asynchronous rotating driver_file_log.
+- Diagnostic logs limited to 10 MB + 4 backups each by default.

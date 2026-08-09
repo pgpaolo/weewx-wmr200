@@ -55,9 +55,219 @@ import weewx.drivers
 import weeutil.weeutil
 
 DRIVER_NAME = 'WMR200'
-DRIVER_VERSION = "3.5.4-gp7-streamresync"
+DRIVER_VERSION = "3.5.4-gp8-archive-trace"
 
 log = logging.getLogger(__name__)
+
+
+class _DriverRootForwardHandler(logging.Handler):
+    """Forward records to the root logger without enabling DEBUG in syslog."""
+
+    def emit(self, record):
+        try:
+            logging.getLogger().handle(record)
+        except Exception:
+            pass
+
+
+class _AsyncDriverFileHandler(logging.Handler):
+    """Format driver records and enqueue them without blocking acquisition."""
+
+    def __init__(self, owner, level=logging.DEBUG):
+        super(_AsyncDriverFileHandler, self).__init__(level)
+        self.owner = owner
+
+    def emit(self, record):
+        try:
+            self.owner.enqueue(self.format(record))
+        except Exception:
+            self.owner.writer_errors += 1
+
+
+class DriverFileLog(object):
+    """Best-effort asynchronous rotating text log for this driver only.
+
+    File I/O runs in a dedicated daemon thread. Queue saturation or write
+    failures never propagate into the weather acquisition path.
+    """
+
+    def __init__(self, enabled=False, path='/var/log/weewx/wmr200-debug.log',
+                 level='DEBUG', max_mb=10, backups=4, queue_size=4096):
+        self.enabled = bool(enabled)
+        self.requested_path = os.path.abspath(os.path.expanduser(str(path)))
+        self.path = self.requested_path
+        self.max_bytes = max(1024 * 1024, int(max_mb) * 1024 * 1024)
+        self.backups = max(1, int(backups))
+        self.queue_size = max(128, int(queue_size))
+        self.records_written = 0
+        self.records_dropped = 0
+        self.writer_errors = 0
+        self._queue = None
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._handler = None
+        self._root_forwarder = None
+        self._previous_level = log.level
+        self._previous_effective_level = log.getEffectiveLevel()
+        self._previous_propagate = log.propagate
+
+        level_name = str(level).upper().strip()
+        self.level_name = level_name if level_name in (
+            'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL') else 'DEBUG'
+        self.level = getattr(logging, self.level_name)
+
+        if not self.enabled:
+            return
+
+        try:
+            candidates = [self.requested_path]
+            fallback_path = '/tmp/wmr200-debug.log'
+            if fallback_path not in candidates:
+                candidates.append(fallback_path)
+
+            errors = []
+            selected_path = None
+            for candidate in candidates:
+                try:
+                    directory = os.path.dirname(candidate)
+                    if directory and not os.path.isdir(directory):
+                        os.makedirs(directory, exist_ok=True)
+                    with open(candidate, 'a', encoding='utf-8'):
+                        pass
+                    selected_path = candidate
+                    break
+                except Exception as exception:
+                    errors.append('%s: %s' % (candidate, exception))
+
+            if selected_path is None:
+                raise OSError('No writable driver log destination; %s' %
+                              '; '.join(errors))
+
+            self.path = selected_path
+            self._queue = queue.Queue(maxsize=self.queue_size)
+            self._thread = threading.Thread(
+                target=self._writer_loop, name='WMR200DriverFileLog')
+            self._thread.daemon = True
+
+            self._handler = _AsyncDriverFileHandler(self, self.level)
+            self._handler.setFormatter(logging.Formatter(
+                '%(asctime)s %(levelname)s %(name)s [%(threadName)s] %(message)s'))
+
+            # To capture DEBUG in the private file without flooding the normal
+            # WeeWX/root handlers, stop propagation and forward only records
+            # that would have passed the logger's previous effective level.
+            if self._previous_propagate:
+                self._root_forwarder = _DriverRootForwardHandler(
+                    level=self._previous_effective_level)
+                log.addHandler(self._root_forwarder)
+                log.propagate = False
+
+            log.addHandler(self._handler)
+            log.setLevel(min(self._previous_effective_level, self.level))
+            self._thread.start()
+
+            if self.path != self.requested_path:
+                logging.getLogger().warning(
+                    'WMR200 driver file log path %s is not writable; using %s',
+                    self.requested_path, self.path)
+        except Exception as exception:
+            self.enabled = False
+            self.writer_errors += 1
+            self._restore_logger()
+            logging.getLogger().error(
+                'Unable to enable WMR200 driver file log at %s: %s. '
+                'Driver will continue without it.', self.path, exception)
+
+    def enqueue(self, line):
+        if not self.enabled or self._queue is None:
+            return
+        try:
+            self._queue.put_nowait(str(line) + '\n')
+        except queue.Full:
+            self.records_dropped += 1
+        except Exception:
+            self.writer_errors += 1
+
+    def _rotate_files(self):
+        oldest = '%s.%d' % (self.path, self.backups)
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for index in range(self.backups - 1, 0, -1):
+            source = '%s.%d' % (self.path, index)
+            target = '%s.%d' % (self.path, index + 1)
+            if os.path.exists(source):
+                os.replace(source, target)
+        if os.path.exists(self.path):
+            os.replace(self.path, self.path + '.1')
+
+    def _writer_loop(self):
+        handle = None
+        try:
+            while not self._stop_event.is_set() or not self._queue.empty():
+                try:
+                    line = self._queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                try:
+                    encoded_length = len(line.encode('utf-8'))
+                    if handle is None:
+                        handle = open(self.path, 'a', buffering=1,
+                                      encoding='utf-8')
+                    try:
+                        current_size = os.path.getsize(self.path)
+                    except OSError:
+                        current_size = 0
+                    if current_size + encoded_length > self.max_bytes:
+                        handle.flush()
+                        handle.close()
+                        handle = None
+                        self._rotate_files()
+                        handle = open(self.path, 'a', buffering=1,
+                                      encoding='utf-8')
+                    handle.write(line)
+                    self.records_written += 1
+                finally:
+                    self._queue.task_done()
+        except Exception as exception:
+            self.writer_errors += 1
+            self.enabled = False
+            logging.getLogger().error(
+                'WMR200 driver file logger stopped after error: %s. '
+                'Weather acquisition will continue.', exception)
+        finally:
+            if handle is not None:
+                try:
+                    handle.flush()
+                    handle.close()
+                except Exception:
+                    pass
+
+    def _restore_logger(self):
+        if self._handler is not None:
+            try:
+                log.removeHandler(self._handler)
+            except Exception:
+                pass
+            self._handler = None
+        if self._root_forwarder is not None:
+            try:
+                log.removeHandler(self._root_forwarder)
+            except Exception:
+                pass
+            self._root_forwarder = None
+        log.setLevel(self._previous_level)
+        log.propagate = self._previous_propagate
+
+    def stop(self, timeout=5.0):
+        if self._thread is None:
+            self._restore_logger()
+            return
+        self._restore_logger()
+        self._stop_event.set()
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            logging.getLogger().warning(
+                'WMR200 driver file logger did not stop within %.1fs', timeout)
 
 
 class DeveloperTrace(object):
@@ -69,7 +279,7 @@ class DeveloperTrace(object):
     """
 
     def __init__(self, enabled=True, path='/var/log/weewx/wmr200-developer-trace.jsonl',
-                 max_mb=20, backups=5, queue_size=4096,
+                 max_mb=10, backups=4, queue_size=4096,
                  include_timeouts=True, include_packets=True):
         self.enabled = bool(enabled)
         self.requested_path = os.path.abspath(os.path.expanduser(str(path)))
@@ -2052,7 +2262,32 @@ class WMR200(weewx.drivers.AbstractDevice):
         """
         super(WMR200, self).__init__()
 
+        # Optional complete text log for this driver. It is asynchronous so
+        # disk I/O never runs in the USB acquisition path.
+        driver_file_log_enabled = weeutil.weeutil.tobool(
+            stn_dict.get('driver_file_log', False))
+        driver_file_log_path = stn_dict.get(
+            'driver_file_log_path', '/var/log/weewx/wmr200-debug.log')
+        driver_file_log_level = stn_dict.get('driver_file_log_level', 'DEBUG')
+        driver_file_log_max_mb = int(stn_dict.get(
+            'driver_file_log_max_mb', 10))
+        driver_file_log_backups = int(stn_dict.get(
+            'driver_file_log_backups', 4))
+        self._driver_file_log = DriverFileLog(
+            enabled=driver_file_log_enabled,
+            path=driver_file_log_path,
+            level=driver_file_log_level,
+            max_mb=driver_file_log_max_mb,
+            backups=driver_file_log_backups,
+            queue_size=4096)
+
         log.info('driver version is %s' % DRIVER_VERSION)
+        if self._driver_file_log.enabled:
+            log.warning('WMR200 driver file log ENABLED: %s level=%s max_mb=%d backups=%d'
+                        % (self._driver_file_log.path,
+                           self._driver_file_log.level_name,
+                           int(driver_file_log_max_mb),
+                           int(driver_file_log_backups)))
 
         # User configurable options
         self._model = stn_dict.get('model', 'WMR200')
@@ -2098,9 +2333,9 @@ class WMR200(weewx.drivers.AbstractDevice):
             'developer_trace_path',
             '/var/log/weewx/wmr200-developer-trace.jsonl')
         developer_trace_max_mb = int(stn_dict.get(
-            'developer_trace_max_mb', 20))
+            'developer_trace_max_mb', 10))
         developer_trace_backups = int(stn_dict.get(
-            'developer_trace_backups', 5))
+            'developer_trace_backups', 4))
         developer_trace_queue_size = int(stn_dict.get(
             'developer_trace_queue_size', 4096))
         developer_trace_include_timeouts = weeutil.weeutil.tobool(
@@ -2125,7 +2360,9 @@ class WMR200(weewx.drivers.AbstractDevice):
             'EVENT', 'driver_start', driver=DRIVER_NAME,
             version=DRIVER_VERSION, model=self._model,
             erase_archive=self._erase_archive,
-            archive_interval=self._archive_interval)
+            archive_interval=self._archive_interval,
+            driver_file_log=self._driver_file_log.enabled,
+            driver_file_log_path=self._driver_file_log.path)
 
         # Device specific hardware and USB recovery options.
         vendor_id = int(stn_dict.get('vendor_id', '0x0fde'), 0)
@@ -2282,6 +2519,9 @@ class WMR200(weewx.drivers.AbstractDevice):
             log.debug('  USB reopen on failure: %s' % self.usb_device.reopen_on_failure)
             log.debug('  Developer trace: %s' % self._developer_trace.enabled)
             log.debug('  Developer trace path: %s' % self._developer_trace.path)
+            log.debug('  Driver file log: %s' % self._driver_file_log.enabled)
+            log.debug('  Driver file log path: %s' % self._driver_file_log.path)
+            log.debug('  Driver file log level: %s' % self._driver_file_log.level_name)
 
     @property
     def hardware_name(self):
@@ -2478,6 +2718,12 @@ class WMR200(weewx.drivers.AbstractDevice):
                     self._developer_trace.records_dropped,
                     self._developer_trace.writer_errors,
                     self._developer_trace.path))
+        log.info('Driver file log stats enabled:%s written:%d dropped:%d errors:%d path:%s'
+                 % (self._driver_file_log.enabled,
+                    self._driver_file_log.records_written,
+                    self._driver_file_log.records_dropped,
+                    self._driver_file_log.writer_errors,
+                    self._driver_file_log.path))
         log.info('USB recovery stats successful_reads:%d timeouts:%d '
                  'timeout_bursts:%d max_consecutive_timeouts:%d '
                  'read_pipe_stalls:%d write_transient_errors:%d '
@@ -2720,150 +2966,306 @@ class WMR200(weewx.drivers.AbstractDevice):
                     log.info('genArchive() Ignoring received archive record before requested timestamp')
 
     def genStartupRecords(self, since_ts=0):
-        """A generator function to present archive packets on start.
+        """Present console archive packets on driver startup.
 
-        weewx api to return archive records."""
+        gp8 adds diagnostic accounting around the existing recovery algorithm.
+        It does not clear the console archive. Every received archive record is
+        classified in the developer trace as yielded, old, duplicate/out of
+        order, threshold-rejected, or sub-minute. A sub-minute anomaly is now
+        dropped locally instead of terminating the entire startup recovery.
+        """
         log.debug('genStartup() phase getting archive packets since %s'
-               % weeutil.weeutil.timestamp_to_string(since_ts))
+                  % weeutil.weeutil.timestamp_to_string(since_ts))
 
         # Reset the current packet upon entry.
         self._pkt = None
 
-        # Time after last archive packet to indicate there are
-        # likely no more archive packets left to drain.
+        # Time after last archive packet to indicate there are likely no more
+        # archive packets left to drain.
         timestamp_last_archive_rx = int(time.time() + 0.5)
 
-        # Statisics to calculate time in this phase.
+        # Statistics used by the original code and by gp8 diagnostics.
         timestamp_packet_first = None
         timestamp_packet_current = None
         timestamp_packet_previous = None
         cnt = 0
 
-        # If no previous database this parameter gets passed as None.
-        # Convert to a numerical value representing start of unix epoch.
         if since_ts is None:
             log.info('genStartup() Database initialization')
             since_ts = 0
+        since_ts = int(since_ts)
 
-        while True:
-            # Loop through indefinitely generating archive records to the
-            # weewx engine.  This loop may resume at the yield()
-            # or upon entry during any exception, even an exception
-            # not generated from this driver.  e.g. weewx.service.
-            if self._pkt is not None and self._pkt.packet_complete():
-                self._process_packet_complete()
+        recovery_started_monotonic = time.monotonic()
+        recovery_outcome = 'consumer_closed'
+        archive_received = 0
+        archive_before_since = 0
+        archive_duplicate = 0
+        archive_out_of_order = 0
+        archive_threshold_drop = 0
+        archive_subminute_drop = 0
+        archive_gap_count = 0
+        archive_gap_seconds = 0
+        archive_max_gap_seconds = 0
+        first_yielded_ts = None
+        last_yielded_ts = None
+        drift_wait_reported = False
 
-            # If it's time to poke the console and we are not
-            # in the middle of collecting a packet then do it here.
-            if self.is_ready_to_poke() and self._pkt is None:
-                self._poke_console()
+        def _utc_iso(epoch_value):
+            if epoch_value is None:
+                return None
+            try:
+                return datetime.datetime.fromtimestamp(
+                    float(epoch_value), datetime.timezone.utc).isoformat(
+                        timespec='seconds')
+            except (TypeError, ValueError, OverflowError, OSError):
+                return None
 
-            # Pull data from the weather console.
-            # This may create a packet or append data to existing packet.
-            self._poll_for_data()
+        self._developer_trace.event(
+            'ARCHIVE', 'archive_recovery_start',
+            since_ts=since_ts,
+            since_utc=_utc_iso(since_ts),
+            archive_interval=self._archive_interval,
+            archive_startup=self._archive_startup,
+            archive_threshold=self._archive_threshold,
+            use_pc_time=self.use_pc_time,
+            time_drift=self.time_drift,
+            erase_archive=self._erase_archive,
+            action='drain_console_archive_without_erasing')
 
-            # If we have archive packets in the queue then yield them here.
-            while PacketArchive.pkt_queue:
-                timestamp_last_archive_rx = int(time.time() + 0.5)
+        try:
+            while True:
+                if self._pkt is not None and self._pkt.packet_complete():
+                    self._process_packet_complete()
 
-                # Present archive packets
-                # If PC time is set, we must have at least one
-                # live packet to calculate timestamps in PC time.
-                if self.use_pc_time and self.time_drift is None:
-                    log.info('genStartup() Delaying archive packet processing until live packet received')
-                    break
+                if self.is_ready_to_poke() and self._pkt is None:
+                    self._poke_console()
 
-                log.info('genStartup() Still receiving archive packets cnt:%d len:%d'
-                         % (cnt, len(PacketArchive.pkt_queue)))
+                self._poll_for_data()
 
-                pkt = PacketArchive.pkt_queue.pop(0)
-                # If we are using PC time we need to adjust the
-                # record timestamp with the PC drift.
-                if self.use_pc_time:
-                    pkt.timestamp_adjust_drift()
+                while PacketArchive.pkt_queue:
+                    timestamp_last_archive_rx = int(time.time() + 0.5)
 
-                # Statisics indicating packets sent in this phase.
-                if timestamp_packet_first is None:
-                    timestamp_packet_first = pkt.timestamp_record()
-                if timestamp_packet_previous is None:
-                    if since_ts == 0:
-                        timestamp_packet_previous = pkt.timestamp_record()
+                    # PC-time mode needs one live timestamp to calculate the
+                    # console/host drift before archive timestamps are adjusted.
+                    if self.use_pc_time and self.time_drift is None:
+                        if not drift_wait_reported:
+                            self._developer_trace.event(
+                                'ARCHIVE', 'archive_recovery_waiting_for_time_drift',
+                                queued_records=len(PacketArchive.pkt_queue),
+                                action='retain_archive_queue_until_live_timestamp')
+                            drift_wait_reported = True
+                        log.info('genStartup() Delaying archive packet processing until live packet received')
+                        break
+
+                    if drift_wait_reported:
+                        self._developer_trace.event(
+                            'ARCHIVE', 'archive_recovery_time_drift_ready',
+                            time_drift=self.time_drift,
+                            queued_records=len(PacketArchive.pkt_queue))
+                        drift_wait_reported = False
+
+                    pkt = PacketArchive.pkt_queue.pop(0)
+                    archive_received += 1
+
+                    if self.use_pc_time:
+                        pkt.timestamp_adjust_drift()
+
+                    current_ts = int(pkt.timestamp_record())
+                    timestamp_packet_current = current_ts
+                    if timestamp_packet_first is None:
+                        timestamp_packet_first = current_ts
+
+                    if timestamp_packet_previous is None:
+                        timestamp_packet_previous = (
+                            current_ts if since_ts == 0 else since_ts)
+
+                    previous_ts = int(timestamp_packet_previous)
+                    timestamp_packet_interval = current_ts - previous_ts
+                    disposition = None
+                    gap_seconds = 0
+
+                    if timestamp_packet_interval < 1:
+                        if timestamp_packet_interval == 0:
+                            archive_duplicate += 1
+                            disposition = 'duplicate'
+                        else:
+                            archive_out_of_order += 1
+                            disposition = 'out_of_order'
+                        log.info(
+                            'genStartup() Discarding archive record %s; '
+                            'current timestamp:%s; previous timestamp:%s' %
+                            (disposition,
+                             weeutil.weeutil.timestamp_to_string(current_ts),
+                             weeutil.weeutil.timestamp_to_string(previous_ts)))
+
+                    elif current_ts > (previous_ts + self._archive_threshold):
+                        archive_threshold_drop += 1
+                        disposition = 'threshold_exceeded'
+                        log.info(
+                            'genStartup() Discarding received archive record '
+                            'exceeding archive threshold cnt:%d threshold:%d '
+                            'timestamp:%s' %
+                            (cnt, self._archive_threshold,
+                             weeutil.weeutil.timestamp_to_string(current_ts)))
+
+                    elif current_ts > since_ts:
+                        packet_record_interval = int(
+                            timestamp_packet_interval / 60.0)
+                        if packet_record_interval == 0:
+                            archive_subminute_drop += 1
+                            disposition = 'subminute_interval'
+                            log.warning(
+                                'genStartup() Discarding sub-minute archive '
+                                'record but CONTINUING recovery; interval=%d '
+                                'timestamp=%s' %
+                                (timestamp_packet_interval,
+                                 weeutil.weeutil.timestamp_to_string(current_ts)))
+                        else:
+                            # Only an accepted archive record advances the
+                            # sequencing reference. A malformed sub-minute
+                            # timestamp therefore cannot poison the rest of
+                            # the startup recovery.
+                            timestamp_packet_previous = current_ts
+                            if timestamp_packet_interval > self._archive_interval:
+                                gap_seconds = max(
+                                    0,
+                                    timestamp_packet_interval -
+                                    self._archive_interval)
+                                archive_gap_count += 1
+                                archive_gap_seconds += gap_seconds
+                                archive_max_gap_seconds = max(
+                                    archive_max_gap_seconds, gap_seconds)
+                                self._developer_trace.event(
+                                    'ARCHIVE', 'archive_recovery_gap',
+                                    previous_ts=previous_ts,
+                                    previous_utc=_utc_iso(previous_ts),
+                                    current_ts=current_ts,
+                                    current_utc=_utc_iso(current_ts),
+                                    interval_seconds=timestamp_packet_interval,
+                                    expected_interval_seconds=self._archive_interval,
+                                    missing_span_seconds=gap_seconds,
+                                    gap_count=archive_gap_count,
+                                    classification='archive_time_gap_detected')
+
+                            pkt.record_update({
+                                'interval': packet_record_interval})
+                            pkt.record_update(
+                                adjust_rain(pkt, PacketArchiveData))
+                            cnt += 1
+                            disposition = 'yielded'
+                            if first_yielded_ts is None:
+                                first_yielded_ts = current_ts
+                            last_yielded_ts = current_ts
+
+                            log.debug(
+                                'genStartup() Yielding archive record cnt:%d '
+                                'after requested timestamp:%d pkt_interval:%d '
+                                'pkt:%s' %
+                                (cnt, since_ts, timestamp_packet_interval,
+                                 weeutil.weeutil.timestamp_to_string(current_ts)))
+                            if DEBUG_PACKETS_COOKED:
+                                pkt.print_cooked()
+                            mapped = self._sensors_to_fields(
+                                pkt.packet_record(), self._sensor_map)
+
                     else:
-                        timestamp_packet_previous = since_ts
+                        timestamp_packet_previous = current_ts
+                        archive_before_since += 1
+                        disposition = 'before_since_ts'
+                        log.info(
+                            'genStartup() Discarding received archive record '
+                            'before time requested cnt:%d timestamp:%s' %
+                            (cnt,
+                             weeutil.weeutil.timestamp_to_string(since_ts)))
 
-                timestamp_packet_current = pkt.timestamp_record()
+                    self._developer_trace.event(
+                        'ARCHIVE', 'archive_record_evaluated',
+                        packet_id=getattr(pkt, 'pkt_id', None),
+                        record_number=archive_received,
+                        record_ts=current_ts,
+                        record_utc=_utc_iso(current_ts),
+                        previous_ts=previous_ts,
+                        previous_utc=_utc_iso(previous_ts),
+                        interval_seconds=timestamp_packet_interval,
+                        disposition=disposition,
+                        gap_seconds=gap_seconds,
+                        yielded_total=cnt,
+                        before_since_total=archive_before_since,
+                        duplicate_total=archive_duplicate,
+                        out_of_order_total=archive_out_of_order,
+                        threshold_drop_total=archive_threshold_drop,
+                        subminute_drop_total=archive_subminute_drop)
 
-                # Calculate time interval between archive packets.
-                timestamp_packet_interval = timestamp_packet_current \
-                        - timestamp_packet_previous
+                    if disposition == 'yielded':
+                        yield mapped
 
-                if timestamp_packet_interval < 1:
-                    log.info(('genStartup() Discarding received archive record that presented out-of-order; '
-                              'current timestamp:%s; previous timestamp:%s')
-                             % (weeutil.weeutil.timestamp_to_string(timestamp_packet_current),
-                                weeutil.weeutil.timestamp_to_string(timestamp_packet_previous)))
-                elif pkt.timestamp_record() > (timestamp_packet_previous
-                                               + self._archive_threshold):
-                    log.info(('genStartup() Discarding received archive'
-                              ' record exceeding archive interval cnt:%d'
-                              ' threshold:%d timestamp:%s')
-                             % (cnt, self._archive_threshold,
-                                weeutil.weeutil.timestamp_to_string(pkt.timestamp_record())))
-                elif pkt.timestamp_record() > since_ts:
-                    # Update the timestamp delta previous value even if
-                    # we do not use this packet.  This is so the next archive
-                    # packet, if any, has the proper delta timestamp
-                    # calculation.
-                    timestamp_packet_previous = timestamp_packet_current
-
-                    # Ensure that the packet has a valid 'interval' field.
-                    packet_record_interval = int(timestamp_packet_interval / 60.0)
-                    if packet_record_interval == 0:
-                        # This packet occurred less than the minimal interval after the
-                        # initial time search space and is discarded.
-                        log.info('genStartup() Discarding received archive record'
-                                 ' since interval is zero')
-                        return
-                    pkt.record_update({'interval': packet_record_interval})
-                    # Calculate the rain accumulation between valid archive
-                    # packets.
-                    pkt.record_update(adjust_rain(pkt, PacketArchiveData))
-                    cnt += 1
-                    log.debug('genStartup() Yielding received archive'
-                              ' record cnt:%d after requested timestamp'
-                              ':%d pkt_interval:%d pkt:%s'
-                              % (cnt, since_ts, timestamp_packet_interval,
-                                 weeutil.weeutil.timestamp_to_string(
-                                     pkt.timestamp_record())))
-                    if DEBUG_PACKETS_COOKED:
-                        pkt.print_cooked()
-                    mapped = self._sensors_to_fields(pkt.packet_record(),
-                                                     self._sensor_map)
-                    yield mapped
-                else:
-                    timestamp_packet_previous = timestamp_packet_current
-                    log.info('genStartup() Discarding received archive'
-                             ' record before time requested cnt:%d'
-                             ' timestamp:%s'
-                             % (cnt, weeutil.weeutil.timestamp_to_string(since_ts)))
-
-            # Return if we receive not more archive packets in a given time
-            # interval.
-            if (int(time.time() + 0.5) - timestamp_last_archive_rx >
-                self._archive_startup):
-                log.info('genStartup() phase exiting since looks like all'
-                         ' archive packets have been retrieved after %d sec cnt:%d'
-                         % (self._archive_startup, cnt))
-                if timestamp_packet_first is not None:
-                    startup_time = timestamp_packet_current - timestamp_packet_first
-
-                    log.info('genStartup() Yielded %d packets in %d sec  between these dates %s ==> %s'
-                             % (cnt, startup_time,
-                                weeutil.weeutil.timestamp_to_string(timestamp_packet_first),
-                                weeutil.weeutil.timestamp_to_string(timestamp_packet_current)))
-                    if startup_time > 0:
-                        log.info(('genStartup() Average packets per minute:%f' % (cnt / (startup_time / 60.0))))
-                return
+                if (int(time.time() + 0.5) - timestamp_last_archive_rx >
+                        self._archive_startup):
+                    recovery_outcome = 'archive_drained'
+                    log.info(
+                        'genStartup() phase exiting since looks like all '
+                        'archive packets have been retrieved after %d sec '
+                        'cnt:%d' % (self._archive_startup, cnt))
+                    if timestamp_packet_first is not None:
+                        data_span = (timestamp_packet_current -
+                                     timestamp_packet_first)
+                        log.info(
+                            'genStartup() Yielded %d packets spanning %d sec '
+                            'between these dates %s ==> %s' %
+                            (cnt, data_span,
+                             weeutil.weeutil.timestamp_to_string(
+                                 timestamp_packet_first),
+                             weeutil.weeutil.timestamp_to_string(
+                                 timestamp_packet_current)))
+                        if data_span > 0:
+                            log.info(
+                                'genStartup() Average yielded packets per '
+                                'data-minute:%f' %
+                                (cnt / (data_span / 60.0)))
+                    return
+        except Exception as exception:
+            recovery_outcome = 'error'
+            self._developer_trace.event(
+                'ARCHIVE', 'archive_recovery_error',
+                error_type=type(exception).__name__,
+                reason=str(exception),
+                records_received=archive_received,
+                records_yielded=cnt)
+            raise
+        finally:
+            elapsed_wall_s = max(
+                0.0, time.monotonic() - recovery_started_monotonic)
+            data_span_s = None
+            if (timestamp_packet_first is not None and
+                    timestamp_packet_current is not None):
+                data_span_s = (timestamp_packet_current -
+                               timestamp_packet_first)
+            self._developer_trace.event(
+                'ARCHIVE', 'archive_recovery_complete',
+                outcome=recovery_outcome,
+                since_ts=since_ts,
+                since_utc=_utc_iso(since_ts),
+                elapsed_wall_s=round(elapsed_wall_s, 3),
+                records_received=archive_received,
+                records_yielded=cnt,
+                records_before_since=archive_before_since,
+                records_duplicate=archive_duplicate,
+                records_out_of_order=archive_out_of_order,
+                records_threshold_dropped=archive_threshold_drop,
+                records_subminute_dropped=archive_subminute_drop,
+                gaps_detected=archive_gap_count,
+                gap_seconds_total=archive_gap_seconds,
+                max_gap_seconds=archive_max_gap_seconds,
+                first_received_ts=timestamp_packet_first,
+                first_received_utc=_utc_iso(timestamp_packet_first),
+                last_received_ts=timestamp_packet_current,
+                last_received_utc=_utc_iso(timestamp_packet_current),
+                first_yielded_ts=first_yielded_ts,
+                first_yielded_utc=_utc_iso(first_yielded_ts),
+                last_yielded_ts=last_yielded_ts,
+                last_yielded_utc=_utc_iso(last_yielded_ts),
+                data_span_seconds=data_span_s,
+                pending_archive_queue=len(PacketArchive.pkt_queue))
 
     def closePort(self):
         """Closes the USB port to the device.
@@ -2924,6 +3326,7 @@ class WMR200(weewx.drivers.AbstractDevice):
             reopens=self.usb_device.reopen_count)
         self._developer_trace.stop()
         log.info('Driver gracefully exiting')
+        self._driver_file_log.stop()
 
     @staticmethod
     def _sensors_to_fields(oldrec, sensor_map):
@@ -2950,28 +3353,43 @@ class WMR200ConfEditor(weewx.drivers.AbstractConfEditor):
     def default_stanza(self):
         return """
 [WMR200]
-    # This section is for the Oregon Scientific WMR200
-
-    # The station model, e.g., WMR200, WMR200A, Radio Shack W200
     model = WMR200
-
-    # The driver to use:
     driver = user.wmr200
 
-    # Diagnostic JSONL trace. Enabled by default in this test build.
+    use_pc_time = True
+    erase_archive = False
+    archive_interval = 60
+    archive_startup = 120
+    archive_threshold = 1512000
+    ignore_checksum = False
+    sensor_status = True
+
+    # USB recovery inherited from gp7-streamresync.
+    usb_write_retries = 3
+    usb_read_retries = 2
+    usb_retry_delay = 0.5
+    usb_reopen_on_failure = True
+    usb_timeout_warn_consecutive = 2
+    usb_timeout_error_consecutive = 4
+    usb_health_interval = 300
+
+    # Structured USB/protocol/archive trace. One active file + four backups.
     developer_trace = true
     developer_trace_path = /var/log/weewx/wmr200-developer-trace.jsonl
-    developer_trace_max_mb = 20
-    developer_trace_backups = 5
+    developer_trace_max_mb = 10
+    developer_trace_backups = 4
     developer_trace_queue_size = 4096
     developer_trace_include_timeouts = true
     developer_trace_include_packets = true
 
-    # USB health classification. One timeout is informational; consecutive
-    # timeouts are promoted to warning/error only for monitoring purposes.
-    usb_timeout_warn_consecutive = 2
-    usb_timeout_error_consecutive = 4
-    usb_health_interval = 300
+    # Complete asynchronous text log for this driver only.
+    driver_file_log = true
+    driver_file_log_path = /var/log/weewx/wmr200-debug.log
+    driver_file_log_level = DEBUG
+    driver_file_log_max_mb = 10
+    driver_file_log_backups = 4
+
+    [[sensor_map]]
 """
 
     def modify_config(self, config_dict):

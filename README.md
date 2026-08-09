@@ -1,346 +1,159 @@
 # WeeWX WMR200 Hardened Driver
 
-USB driver for **Oregon Scientific WMR200 / WMR200A** weather-station consoles, designed for **WeeWX 4 and WeeWX 5**.
+Advanced USB driver for **Oregon Scientific WMR200 / WMR200A** weather-station consoles, designed for **WeeWX 4 and WeeWX 5**.
 
-This fork preserves the packet decoder and archive handling of the historical WMR200 driver while adding USB recovery, protocol-stream resynchronization, and non-blocking JSONL diagnostics.
+This fork preserves the packet decoder and archive handling of the historical WMR200 driver while adding USB recovery, protocol-stream resynchronization, non-blocking diagnostics, and startup archive-recovery tracing.
 
-> **Driver version:** `3.5.4-gp7-streamresync`  
+> **Driver version:** `3.5.4-gp8-archive-trace`  
+> **Baseline:** `3.5.4-gp7-streamresync`  
 > **Status:** community project; not officially supported by the WeeWX project.
 
-## Main features
+## Highlights
 
-- live and archive packet acquisition from the WMR200 console;
-- support for multi-channel temperature and humidity, pressure, wind, rain, UV, and sensor-status packets;
-- bounded retry logic for USB reads and writes;
-- recovery from `EPIPE`, endpoint stalls, and transient libusb errors;
-- controlled release, rediscovery, and reopening of the USB device;
-- detection of malformed HID reports;
-- parser resynchronization after a discontinuity in the USB byte stream;
-- isolated rejection of invalid-checksum packets without restarting WeeWX;
-- USB health and consecutive-timeout monitoring;
-- asynchronous, rotating JSONL developer trace, separate from the normal WeeWX log;
-- controlled thread shutdown with a final diagnostic summary.
+- bounded recovery for USB timeout / EPIPE conditions;
+- controlled USB handle reopen after repeated transfer failures;
+- protocol stream resynchronization after malformed HID reports;
+- checksum failures drop the affected packet without restarting WeeWX;
+- structured JSONL RX/TX and protocol developer trace;
+- startup archive-recovery diagnostics with gap, duplicate and out-of-order detection;
+- asynchronous rotating textual driver log;
+- diagnostic logging isolated from weather acquisition;
+- WMR200 archive preserved by default (`erase_archive = False`).
 
-## Reference environment
-
-The GP variant has primarily been used with:
-
-- Debian 12 / Raspberry Pi OS;
-- WeeWX 5.1.x;
-- Python 3;
-- an Oregon Scientific WMR200/WMR200A console connected through USB.
-
-The extension layout retains compatibility with WeeWX 4, although the most recent changes have mainly been validated on WeeWX 5.
-
-## Project origin
-
-This project is derived from the historical WeeWX WMR200 driver, which was later separated from the main WeeWX distribution. Original copyright notices and contributor credits are preserved in the source code.
-
-The `gp7-streamresync` variant adds USB hardening and advanced diagnostics. It is not an official WeeWX release.
-
-## Installation
-
-### 1. Back up the configuration
-
-```bash
-sudo cp -a /etc/weewx/weewx.conf \
-  /etc/weewx/weewx.conf.$(date +%Y%m%d-%H%M%S).bak
-```
-
-The configuration path may be different for WeeWX installations created with `pip` or inside a virtual environment.
-
-### 2. Stop WeeWX
-
-```bash
-sudo systemctl stop weewx
-```
-
-### 3. Install on WeeWX 5
-
-From a local ZIP archive:
-
-```bash
-sudo weectl extension install ./weewx-wmr200.zip
-```
-
-Directly from GitHub, after replacing `<OWNER>` and `<REPOSITORY>`:
-
-```bash
-sudo weectl extension install \
-  https://github.com/<OWNER>/<REPOSITORY>/archive/refs/heads/main.zip
-```
-
-Run the station reconfiguration wizard:
-
-```bash
-sudo weectl station reconfigure --driver=user.wmr200
-```
-
-### 4. Install on WeeWX 4
-
-```bash
-sudo wee_extension --install=./weewx-wmr200.zip
-sudo wee_config --reconfigure --driver=user.wmr200 --no-prompt
-```
-
-### 5. Install the udev rule
-
-The archive contains:
+## Repository layout
 
 ```text
-util/udev/rules.d/wmr200.rules
+bin/user/wmr200.py
+                    Main WeeWX driver
+
+docs/
+                    Installation, diagnostics, testing and upgrade notes
+
+util/udev/rules.d/
+                    Linux udev rule for WMR200 USB access and autosuspend
+
+install.py
+                    WeeWX ExtensionInstaller definition
+
+README.md
+CHANGELOG.md
+changelog
 ```
-
-Recommended manual installation:
-
-```bash
-sudo install -m 0644 util/udev/rules.d/wmr200.rules \
-  /etc/udev/rules.d/60-wmr200.rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-```
-
-The rule grants access to USB device `0fde:ca01` and disables USB autosuspend for the console.
-
-After applying the rule, disconnect and reconnect the WMR200, or reboot the host.
 
 ## Recommended configuration
 
-Add or update the following sections in `weewx.conf`:
-
 ```ini
-[Station]
-    station_type = WMR200
-
 [WMR200]
     model = WMR200
     driver = user.wmr200
 
-    # Timestamps and archive handling
-    use_pc_time = true
-    erase_archive = false
+    use_pc_time = True
+    erase_archive = False
     archive_interval = 60
     archive_startup = 120
-    archive_threshold = 604800
-    ignore_checksum = false
-    sensor_status = true
+    archive_threshold = 1512000
+    ignore_checksum = False
+    sensor_status = True
 
     # USB recovery
     usb_write_retries = 3
     usb_read_retries = 2
     usb_retry_delay = 0.5
-    usb_reopen_on_failure = true
+    usb_reopen_on_failure = True
 
-    # USB timeout classification
-    usb_timeout_warn_consecutive = 2
-    usb_timeout_error_consecutive = 4
-    usb_health_interval = 300
-
-    # JSONL developer trace
-    developer_trace = true
+    # Structured USB / protocol trace
+    developer_trace = True
     developer_trace_path = /var/log/weewx/wmr200-developer-trace.jsonl
-    developer_trace_max_mb = 20
-    developer_trace_backups = 5
+    developer_trace_max_mb = 10
+    developer_trace_backups = 4
     developer_trace_queue_size = 4096
-    developer_trace_include_timeouts = true
-    developer_trace_include_packets = true
+    developer_trace_include_timeouts = True
+    developer_trace_include_packets = True
+
+    # Complete textual driver log
+    driver_file_log = True
+    driver_file_log_path = /var/log/weewx/wmr200-debug.log
+    driver_file_log_level = DEBUG
+    driver_file_log_max_mb = 10
+    driver_file_log_backups = 4
 
     [[sensor_map]]
 ```
 
-### Main configuration options
+Each diagnostic log family is bounded to **one active file plus four backups**: 5 files maximum, approximately 50 MB per family with the defaults above.
 
-| Option | Default | Description |
-|---|---:|---|
-| `model` | `WMR200` | Model name displayed by WeeWX. |
-| `use_pc_time` | `true` | Uses the computer clock instead of the console clock. |
-| `erase_archive` | `false` | Erases the console's internal archive at startup. Use with caution. |
-| `archive_interval` | `60` | Archive interval in seconds. Values `60` and `300` are considered validated by the driver. |
-| `archive_startup` | `120` | Time without new archive packets before switching to live mode. |
-| `archive_threshold` | `604800` | Maximum accepted difference between archive timestamps before an anomalous record is discarded. |
-| `ignore_checksum` | `false` | Controls the error class used for a bad checksum; the invalid packet is still discarded without stopping the driver. |
-| `sensor_status` | `true` | Writes sensor faults and status information to the normal WeeWX log. |
-| `usb_write_retries` | `3` | Maximum number of attempts for a USB write. |
-| `usb_read_retries` | `2` | Maximum number of retry attempts after a read-side pipe stall. |
-| `usb_retry_delay` | `0.5` | Delay, in seconds, between USB retry attempts. |
-| `usb_reopen_on_failure` | `true` | Reopens the device after repeated USB failures. |
-| `usb_timeout_warn_consecutive` | `2` | Consecutive timeout count that changes health state to `warning`. |
-| `usb_timeout_error_consecutive` | `4` | Consecutive timeout count that changes health state to `degraded`. |
-| `usb_health_interval` | `300` | Minimum interval, in seconds, between periodic USB health snapshots. |
-| `developer_trace` | `true` | Enables the structured developer trace. Disable it when diagnostics are not required. |
-| `developer_trace_path` | `/var/log/weewx/wmr200-developer-trace.jsonl` | Preferred trace-file path. |
-| `developer_trace_max_mb` | `20` | Maximum size of the active trace file before rotation. |
-| `developer_trace_backups` | `5` | Number of rotated trace files retained. |
-| `developer_trace_queue_size` | `4096` | Maximum number of pending trace records in the non-blocking writer queue. |
-| `developer_trace_include_timeouts` | `true` | Includes individual USB timeout records. |
-| `developer_trace_include_packets` | `true` | Includes complete and decoded packet records. |
+## Installation — upgrade from an existing WMR200 driver
 
-## Developer trace
-
-The JSONL trace is designed not to block the weather-acquisition loop:
-
-- records are written by a dedicated thread;
-- the queue is bounded;
-- writer errors do not stop the driver;
-- the file rotates automatically;
-- if the configured path is not writable, the driver attempts the following fallback:
-
-```text
-/tmp/wmr200-developer-trace.jsonl
-```
-
-Full documentation:
-
-- [`docs/DEVELOPER-TRACE.md`](docs/DEVELOPER-TRACE.md)
-
-Quick checks:
-
-```bash
-sudo journalctl -u weewx -n 100 --no-pager | grep -i wmr200
-sudo tail -f /var/log/weewx/wmr200-developer-trace.jsonl
-```
-
-## Post-installation verification
-
-```bash
-sudo systemctl restart weewx
-sudo systemctl status weewx --no-pager
-sudo journalctl -u weewx -n 150 --no-pager
-```
-
-The normal log should contain messages similar to:
-
-```text
-driver version is 3.5.4-gp7-streamresync
-Opened WMR200 USB device VendorID=0x0fde ProductID=0xca01
-WMR200 developer trace active at /var/log/weewx/wmr200-developer-trace.jsonl
-```
-
-Verify that the USB device is visible:
-
-```bash
-lsusb | grep -i '0fde:ca01'
-```
-
-Check the Python syntax before restarting WeeWX:
-
-```bash
-python3 -m py_compile /usr/share/weewx/user/wmr200.py
-```
-
-The installed driver path may vary depending on how WeeWX was installed.
-
-## Updating
+From a clone/download of this repository:
 
 ```bash
 sudo systemctl stop weewx
-sudo weectl extension install --yes ./weewx-wmr200.zip
+sudo cp bin/user/wmr200.py /etc/weewx/bin/user/wmr200.py
+sudo mkdir -p /var/log/weewx
+sudo chown weewx:weewx /var/log/weewx
 sudo systemctl start weewx
 ```
 
-Always check the command-line options supported by the installed WeeWX version:
+The exact WeeWX user-extension directory can differ according to the installation method. For WeeWX 5 package installations, use the path shown by your existing driver installation.
+
+## Installation as a WeeWX extension
 
 ```bash
-weectl extension install --help
+sudo weectl extension install .
+sudo weectl station reconfigure --driver=user.wmr200
 ```
 
-## Uninstalling
-
-On WeeWX 5:
+Install the supplied udev rule if required:
 
 ```bash
-sudo weectl extension uninstall wmr200
-```
-
-Remove the udev rule manually only when it is no longer needed:
-
-```bash
-sudo rm -f /etc/udev/rules.d/60-wmr200.rules
+sudo cp util/udev/rules.d/wmr200.rules /etc/udev/rules.d/99-wmr200.rules
 sudo udevadm control --reload-rules
+sudo udevadm trigger
 ```
 
-## Sensor mapping
+Reconnect the WMR200 USB cable, or reboot the host, after changing udev rules.
 
-Example: map `extraTemp1` and `extraHumid1` to the temperature/humidity sensor on channel 5:
+See [docs/INSTALLAZIONE-IT.md](docs/INSTALLAZIONE-IT.md) for the complete procedure.
+
+## Diagnostics
+
+Structured trace:
+
+```text
+/var/log/weewx/wmr200-developer-trace.jsonl
+```
+
+Text driver log:
+
+```text
+/var/log/weewx/wmr200-debug.log
+```
+
+The gp8 trace adds archive events such as:
+
+- `archive_recovery_start`
+- `archive_recovery_record`
+- `archive_recovery_gap`
+- `archive_recovery_complete`
+
+This makes it possible to verify recovery of historical records after WeeWX has been offline while the WMR200 console continued logging locally.
+
+## Documentation
+
+- [Installation (Italian)](docs/INSTALLAZIONE-IT.md)
+- [Developer trace (Italian)](docs/DEVELOPER-TRACE-IT.md)
+- [Testing (Italian)](docs/TESTING-IT.md)
+- [Upgrade gp7 → gp8 (Italian)](docs/UPGRADE-GP7-TO-GP8-IT.md)
+- [Changelog](CHANGELOG.md)
+
+## Safety
+
+The recommended configuration keeps:
 
 ```ini
-[WMR200]
-    [[sensor_map]]
-        extraTemp1 = temperature_5
-        extraHumid1 = humidity_5
+erase_archive = False
 ```
 
-Main default mapping:
+so the console archive is not intentionally erased during normal startup recovery.
 
-| WeeWX field | WMR200 observation |
-|---|---|
-| `inTemp` | `temperature_0` |
-| `outTemp` | `temperature_1` |
-| `inHumidity` | `humidity_0` |
-| `outHumidity` | `humidity_1` |
-| `windSpeed` | `wind_speed` |
-| `windDir` | `wind_dir` |
-| `windGust` | `wind_gust` |
-| `pressure` | `pressure` |
-| `altimeter` | `altimeter` |
-| `rain` | calculated by the driver from `rain_total` |
-| `rainRate` | `rain_rate` |
-| `UV` | `uv` |
-
-Channels `temperature_2` through `temperature_8` and `humidity_2` through `humidity_8` are mapped to WeeWX extra fields.
-
-## Basic troubleshooting
-
-### USB device not found
-
-```bash
-lsusb
-sudo journalctl -u weewx -b --no-pager | grep -Ei 'wmr200|usb|0fde|ca01'
-```
-
-Check:
-
-- that device `0fde:ca01` is present;
-- that the udev rule is installed and active;
-- that the WeeWX service account has permission to access the device;
-- that no other process has already claimed the USB interface.
-
-### Trace file not created in `/var/log/weewx`
-
-Check the normal WeeWX log:
-
-```bash
-sudo journalctl -u weewx -n 100 --no-pager | grep -i 'developer trace'
-```
-
-The driver explicitly reports whether it has switched to the `/tmp` fallback path.
-
-### USB timeouts
-
-A single `usb_read_timeout` does not prove that a weather packet was lost. The trace distinguishes between:
-
-- an isolated informational timeout;
-- a sequence of timeouts in `warning` state;
-- a prolonged sequence in `degraded` state;
-- the subsequent `usb_read_recovered` event.
-
-See the dedicated trace guide for correct interpretation.
-
-## Changelog
-
-See [`CHANGELOG.md`](CHANGELOG.md).
-
-## Credits
-
-- Chris Manton — original driver;
-- Lars de Bruin — packet-decoding contributions;
-- John E.P. Hynes / HyTronix — upstream maintenance and USB fixes;
-- Gianpaolo P. / pgpaolo - variant — USB hardening, JSONL diagnostics, and protocol-stream resynchronization.
-
-## License and redistribution
-
-
-
-## Disclaimer
-
-This driver is provided without warranty. Test configuration changes on a non-production system whenever possible, and keep backups of `weewx.conf` and the weather database before upgrading a production station.
+Diagnostic writers are best-effort and asynchronous. Logging failures are designed not to propagate into the weather-acquisition path.
