@@ -1,8 +1,17 @@
+3.5.4-gp9-live-scheduler
+- Baseline: 3.5.4-gp8-archive-trace.
+- Preserved gp8 decoder, checksum, EPIPE/reopen and stream-resync behavior.
+- Replaced 15 s blocking interrupt reads with 2 s scheduling slices.
+- Preserved logical timeout accounting at 15 s of continuous silence.
+- Added heartbeat request/dispatch latency and USB lock-wait trace fields.
+- Added explicit LIVE/ARCHIVE protocol mode state.
+- D1 requests archive data only during startup archive recovery.
+- D2 received in LIVE no longer requests additional archive records.
+- D2 received in LIVE is traced and not retained in PacketArchive.pkt_queue.
+- Static packet queues are cleared on driver instance startup.
+- Diagnostic logs remain limited to 10 MB + 4 backups each.
+
 3.5.4-gp8-archive-trace
-- Baseline: 3.5.4-gp7-streamresync.
-- Preserved gp7 USB timeout/EPIPE/reopen/stream-resync behavior.
-- Added structured startup archive recovery tracing and gap accounting.
-- Added duplicate/out-of-order archive diagnostics and final recovery summary.
-- Sub-minute archive anomalies are dropped without aborting recovery.
+- Added structured startup archive recovery diagnostics and gap accounting.
 - Added asynchronous rotating driver_file_log.
-- Diagnostic logs limited to 10 MB + 4 backups each by default.
+- Sub-minute archive anomalies are dropped without aborting recovery.

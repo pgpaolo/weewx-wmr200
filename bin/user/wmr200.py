@@ -55,7 +55,7 @@ import weewx.drivers
 import weeutil.weeutil
 
 DRIVER_NAME = 'WMR200'
-DRIVER_VERSION = "3.5.4-gp8-archive-trace"
+DRIVER_VERSION = "3.5.4-gp9-live-scheduler"
 
 log = logging.getLogger(__name__)
 
@@ -384,7 +384,8 @@ class DeveloperTrace(object):
         """Queue one trace record without waiting for disk I/O."""
         if not self.enabled or self._queue is None:
             return
-        if event_name == 'usb_read_timeout' and not self.include_timeouts:
+        if (event_name in ('usb_read_timeout', 'usb_poll_timeout') and
+                not self.include_timeouts):
             return
 
         try:
@@ -522,9 +523,12 @@ _WMR200_USB_POLL_INTERVAL = 1
 # Time interval in secs to send data to the wmr200 to request live data.
 _WMR200_REQUEST_LIVE_DATA_INTERVAL = 30
 
-# Time in secs to block and wait for data from the weather console device.
-# Related to time to request live data.
-_WMR200_USB_READ_DATA_INTERVAL = _WMR200_REQUEST_LIVE_DATA_INTERVAL / 2
+# Keep each blocking interrupt read short. The same lock serializes PyUSB
+# reads and control writes, so a long blocking read can delay the D0 heartbeat.
+# gp9 uses short read slices while preserving the historical 15-second
+# communication-timeout semantics separately.
+_WMR200_USB_READ_DATA_INTERVAL = 2.0
+_WMR200_USB_LOGICAL_TIMEOUT_INTERVAL = 15.0
 
 # Time in ms to wait for USB control transfers to complete.
 _WMR200_USB_RESET_TIMEOUT = 1000
@@ -604,8 +608,14 @@ class UsbDevice(object):
 
     def __init__(self, trace=None):
         self.trace = trace
-        # Polling read timeout.
+        # One blocking interrupt-read slice. Keep this short so control
+        # writes (especially the D0 live heartbeat) cannot sit behind the USB
+        # I/O lock for the historical 15-second read timeout.
         self.timeout_read = _WMR200_USB_READ_DATA_INTERVAL
+        # Logical communication timeout. Multiple short read slices are
+        # combined into one historical-style timeout every 15 seconds of
+        # continuous silence. This keeps monitoring/recovery semantics stable.
+        self.logical_timeout_interval = _WMR200_USB_LOGICAL_TIMEOUT_INTERVAL
         # USB device used for libusb.
         self.dev = None
         # Holds device handle for access.
@@ -627,7 +637,12 @@ class UsbDevice(object):
         self.reopen_delay = _WMR200_USB_REOPEN_DELAY
         self.reopen_on_failure = True
         self.reopen_count = 0
+        # read_poll_timeout_count counts short scheduling slices that returned
+        # no data. read_timeout_count counts logical 15-second communication
+        # timeouts, preserving the gp7/gp8 health semantics.
+        self.read_poll_timeout_count = 0
         self.read_timeout_count = 0
+        self._logical_timeout_level = 0
         self.read_pipe_stall_count = 0
         self.write_transient_error_count = 0
         self.malformed_report_count = 0
@@ -698,6 +713,9 @@ class UsbDevice(object):
             trigger=trigger,
             successful_reads=self.successful_read_count,
             read_timeouts=self.read_timeout_count,
+            poll_slice_timeouts=self.read_poll_timeout_count,
+            read_slice_seconds=self.timeout_read,
+            logical_timeout_seconds=self.logical_timeout_interval,
             timeout_bursts=self.timeout_burst_count,
             timeout_consecutive=self.consecutive_read_timeouts,
             max_consecutive_timeouts=self.max_consecutive_read_timeouts,
@@ -719,6 +737,7 @@ class UsbDevice(object):
         self._last_success_monotonic = now_monotonic
         self._last_success_utc = self._utc_timestamp()
         self.consecutive_read_timeouts = 0
+        self._logical_timeout_level = 0
 
         if recovered_timeouts:
             recovery_severity = ('WARNING'
@@ -918,7 +937,7 @@ class UsbDevice(object):
                     report = self.handle.interruptRead(
                         self.in_endpoint,
                         _WMR200_USB_FRAME_SIZE,
-                        int(self.timeout_read) * 1000)
+                        max(1, int(round(float(self.timeout_read) * 1000))))
 
                 if not report:
                     self.last_read_status = 'timeout'
@@ -968,55 +987,87 @@ class UsbDevice(object):
             except usb.USBError as exception:
                 number = self._error_number(exception)
                 if self._is_timeout(exception):
-                    self.last_read_status = 'timeout'
+                    # gp9: this is only a short scheduling slice timeout. It
+                    # releases _io_lock so a pending D0/DA control write can
+                    # run promptly. Health/recovery timeout accounting remains
+                    # based on 15-second logical silence intervals.
+                    self.last_read_status = 'poll_timeout'
                     now_monotonic = time.monotonic()
-                    self.read_timeout_count += 1
-                    if self.consecutive_read_timeouts == 0:
-                        self.timeout_burst_count += 1
-                    self.consecutive_read_timeouts += 1
-                    self.max_consecutive_read_timeouts = max(
-                        self.max_consecutive_read_timeouts,
-                        self.consecutive_read_timeouts)
-                    severity, health_state = self._timeout_health()
+                    self.read_poll_timeout_count += 1
                     silence_seconds = self._seconds_since_last_success(
                         now_monotonic)
+                    logical_interval = max(
+                        1.0, float(self.logical_timeout_interval))
+                    logical_level = int(silence_seconds // logical_interval)
 
                     self._trace(
-                        'RX', 'usb_read_timeout',
-                        severity=severity,
-                        health_state=health_state,
-                        classification='poll_timeout_no_data',
+                        'RX', 'usb_poll_timeout',
+                        classification='short_interrupt_read_slice_timeout',
                         errno=number,
-                        timeout_seconds=int(self.timeout_read),
-                        timeout_total=self.read_timeout_count,
-                        timeout_bursts=self.timeout_burst_count,
-                        timeout_consecutive=self.consecutive_read_timeouts,
-                        max_consecutive_timeouts=self.max_consecutive_read_timeouts,
+                        poll_slice_seconds=round(float(self.timeout_read), 3),
+                        poll_timeout_total=self.read_poll_timeout_count,
+                        logical_timeout_seconds=logical_interval,
+                        logical_timeout_level=logical_level,
                         seconds_since_last_success=round(silence_seconds, 3),
                         last_success_utc=self._last_success_utc,
                         reason=str(exception),
-                        impact=('not_confirmed_packet_loss'
-                                if severity == 'INFO'
-                                else 'possible_data_gap'),
-                        action='continue_polling')
+                        impact='none_by_itself',
+                        action='release_usb_lock_and_continue_polling')
 
-                    # Force a health record exactly when the state changes from
-                    # normal to warning or error. Isolated timeouts remain INFO.
-                    if self.consecutive_read_timeouts in (
-                            self.timeout_warn_consecutive,
-                            self.timeout_error_consecutive):
-                        self._trace_health_snapshot(
-                            trigger='timeout_threshold', force=True,
-                            now_monotonic=now_monotonic)
-                    else:
-                        self._trace_health_snapshot(
-                            trigger='timeout', now_monotonic=now_monotonic)
+                    # Promote only newly crossed logical timeout boundaries.
+                    # For example, seven 2-second poll slices are still only
+                    # one 15-second communication timeout.
+                    if logical_level > self._logical_timeout_level:
+                        previous_level = self._logical_timeout_level
+                        delta = logical_level - previous_level
+                        if previous_level == 0:
+                            self.timeout_burst_count += 1
+                        self.read_timeout_count += delta
+                        self._logical_timeout_level = logical_level
+                        self.consecutive_read_timeouts = logical_level
+                        self.max_consecutive_read_timeouts = max(
+                            self.max_consecutive_read_timeouts, logical_level)
+                        severity, health_state = self._timeout_health()
 
-                    log.debug('No data received in %d seconds '
-                              '(USB errno=%s consecutive=%d total=%d)' %
-                              (int(self.timeout_read), number,
-                               self.consecutive_read_timeouts,
-                               self.read_timeout_count))
+                        self._trace(
+                            'RX', 'usb_read_timeout',
+                            severity=severity,
+                            health_state=health_state,
+                            classification='logical_communication_silence',
+                            errno=number,
+                            timeout_seconds=logical_interval,
+                            poll_slice_seconds=round(
+                                float(self.timeout_read), 3),
+                            poll_timeout_total=self.read_poll_timeout_count,
+                            timeout_total=self.read_timeout_count,
+                            timeout_bursts=self.timeout_burst_count,
+                            timeout_consecutive=self.consecutive_read_timeouts,
+                            max_consecutive_timeouts=self.max_consecutive_read_timeouts,
+                            seconds_since_last_success=round(
+                                silence_seconds, 3),
+                            last_success_utc=self._last_success_utc,
+                            reason=str(exception),
+                            impact=('not_confirmed_packet_loss'
+                                    if severity == 'INFO'
+                                    else 'possible_data_gap'),
+                            action='request_heartbeat_and_continue_polling')
+
+                        if self.consecutive_read_timeouts in (
+                                self.timeout_warn_consecutive,
+                                self.timeout_error_consecutive):
+                            self._trace_health_snapshot(
+                                trigger='timeout_threshold', force=True,
+                                now_monotonic=now_monotonic)
+                        else:
+                            self._trace_health_snapshot(
+                                trigger='timeout',
+                                now_monotonic=now_monotonic)
+
+                        log.debug(
+                            'Logical USB silence timeout level=%d total=%d '
+                            'silence=%.1fs (poll slices=%d)' %
+                            (logical_level, self.read_timeout_count,
+                             silence_seconds, self.read_poll_timeout_count))
                     return []
 
                 if self._is_pipe_stall(exception):
@@ -1065,8 +1116,14 @@ class UsbDevice(object):
         return []
 
     def _control_write_once(self, buf, value):
-        """Perform one serialized USB control transfer."""
+        """Perform one serialized USB control transfer.
+
+        Return the time spent waiting to acquire the shared PyUSB I/O lock.
+        gp9 records this so heartbeat scheduling can be verified from a trace.
+        """
+        wait_started = time.monotonic()
         with self._io_lock:
+            lock_wait_s = max(0.0, time.monotonic() - wait_started)
             if not self.handle:
                 raise weewx.WeeWxIOError(
                     'write_device() No USB handle for usb_device Write')
@@ -1077,6 +1134,7 @@ class UsbDevice(object):
                 value,                                 # value
                 0x0000000,                             # index
                 _WMR200_USB_RESET_TIMEOUT)             # timeout
+            return lock_wait_s
 
     def write_device(self, buf):
         """Write a command with bounded retry and one controlled reopen."""
@@ -1090,12 +1148,13 @@ class UsbDevice(object):
         last_exception = None
         for attempt in range(1, retries + 1):
             try:
-                self._control_write_once(buf, value)
+                lock_wait_s = self._control_write_once(buf, value)
                 self.byte_cnt_wr += len(buf)
                 self._trace('TX', 'usb_control_write', data=buf,
                             attempt=attempt, retries=retries,
-                            status='ok', value='0x%08x' % value)
-                return
+                            status='ok', value='0x%08x' % value,
+                            lock_wait_s=round(lock_wait_s, 6))
+                return lock_wait_s
             except usb.USBError as exception:
                 last_exception = exception
                 number = self._error_number(exception)
@@ -1124,13 +1183,14 @@ class UsbDevice(object):
         if self.reopen_on_failure:
             try:
                 self.reopen_device('repeated control-transfer failures')
-                self._control_write_once(buf, value)
+                lock_wait_s = self._control_write_once(buf, value)
                 self.byte_cnt_wr += len(buf)
                 self._trace('TX', 'usb_control_write', data=buf,
                             attempt='after_reopen', status='ok',
-                            value='0x%08x' % value)
+                            value='0x%08x' % value,
+                            lock_wait_s=round(lock_wait_s, 6))
                 log.warning('write_device() Command succeeded after USB reopen')
-                return
+                return lock_wait_s
             except (usb.USBError, weewx.WeeWxIOError, weewx.WakeupError) as exception:
                 last_exception = exception
                 self._trace('TX', 'usb_control_write', data=buf,
@@ -1500,10 +1560,9 @@ class PacketArchiveReady(PacketControl):
         super(PacketArchiveReady, self).__init__(wmr200)
 
     def packet_process(self):
-        """Returns a records field to be processed by the weewx engine."""
+        """Handle archive-ready according to the active driver mode."""
         super(PacketArchiveReady, self).packet_process()
-        # Immediately request to the console a command to send archived data.
-        self.wmr200.request_archive_data()
+        self.wmr200.handle_archive_ready(packet_id=self.pkt_id)
 
 class PacketArchiveData(PacketArchive):
     """Packet parser for archived data."""
@@ -1535,8 +1594,10 @@ class PacketArchiveData(PacketArchive):
             msg = ('%s decode index failure' % self.pkt_name)
             raise WMR200ProtocolError(msg)
 
-        # Tell wmr200 console we have processed it and can handle more.
-        self.wmr200.request_archive_data()
+        # During startup archive recovery request the next historical
+        # record. During normal LIVE mode gp9 must not accidentally start or
+        # continue an archive-drain cycle.
+        self.wmr200.handle_archive_data_processed(self)
 
         if DEBUG_PACKETS_ARCHIVE:
             log.debug('  Archive packet num_temp_sensors:%d' % num_sensors)
@@ -2026,7 +2087,7 @@ class RequestLiveData(threading.Thread):
         also tells it to expire."""
         log.info('Started watchdog thread live data')
         while True:
-            self.wmr200.ready_to_poke(True)
+            self.wmr200.ready_to_poke(True, reason='watchdog')
             main_thread_comm = \
                     select.select([self.sock_rd], [], [], self.poke_time)
             if main_thread_comm[0]:
@@ -2076,14 +2137,12 @@ class PollUsbDevice(threading.Thread):
 
             # Read and discard the first report after a reset.
             _ = self.usb_device.read_device()
-            read_timeout_cnt = 0
             read_reset_cnt = 0
 
             while self.wmr200.poll_usb_device_enable():
                 buf = self.usb_device.read_device()
                 if buf:
                     self._append_usb_device(buf)
-                    read_timeout_cnt = 0
                     read_reset_cnt = 0
                     continue
 
@@ -2095,28 +2154,40 @@ class PollUsbDevice(threading.Thread):
                     self._append_usb_stream_gap(
                         self.usb_device.stream_gap_count,
                         self.usb_device.last_stream_gap_reason)
-                    read_timeout_cnt = 0
                     read_reset_cnt = 0
                     continue
 
                 # Empty-but-valid reports and successful USB recovery are not
                 # communication timeouts and must not trigger console resets.
                 if read_status in ('empty', 'recovered'):
-                    read_timeout_cnt = 0
                     read_reset_cnt = 0
                     continue
 
-                # A polling timeout is recoverable. Ask the main thread to
-                # send a heartbeat, then escalate to a console reset.
-                self.wmr200.ready_to_poke(True)
-                read_timeout_cnt += 1
-                if read_timeout_cnt >= 4:
-                    self.reset_console()
-                    read_timeout_cnt = 0
-                    read_reset_cnt += 1
-                if read_reset_cnt >= 2:
-                    raise weewx.RetriesExceeded(
-                        'Device unresponsive after multiple console resets')
+                if read_status == 'poll_timeout':
+                    # Short read slices merely release the USB lock. Escalate
+                    # only when a full logical 15-second silence boundary has
+                    # been crossed, preserving gp7/gp8 recovery thresholds.
+                    logical_level = self.usb_device.consecutive_read_timeouts
+                    if logical_level >= 1:
+                        self.wmr200.ready_to_poke(
+                            True, reason='usb_silence_timeout')
+
+                    # gp7/gp8 reset after four consecutive 15-second timeouts.
+                    # With short read slices that is still one reset after
+                    # roughly 60 seconds of continuous communication silence.
+                    next_reset_level = 4 * (read_reset_cnt + 1)
+                    if logical_level >= next_reset_level:
+                        self.reset_console()
+                        read_reset_cnt += 1
+                        if read_reset_cnt >= 2:
+                            raise weewx.RetriesExceeded(
+                                'Device unresponsive after multiple console resets')
+                    continue
+
+                # Unknown/no-data states retain the conservative gp8 behavior:
+                # ask the main thread for a heartbeat but do not manufacture a
+                # timeout counter from a short scheduling slice.
+                self.wmr200.ready_to_poke(True, reason='usb_read_no_data')
 
         except Exception as exception:
             self._fatal_error = exception
@@ -2383,6 +2454,11 @@ class WMR200(weewx.drivers.AbstractDevice):
             'usb_timeout_error_consecutive', 4))
         usb_health_interval = float(stn_dict.get(
             'usb_health_interval', 300))
+        usb_read_slice_timeout = float(stn_dict.get(
+            'usb_read_slice_timeout', _WMR200_USB_READ_DATA_INTERVAL))
+        usb_logical_timeout_seconds = float(stn_dict.get(
+            'usb_logical_timeout_seconds',
+            _WMR200_USB_LOGICAL_TIMEOUT_INTERVAL))
 
         # Buffer of bytes read from weather console device.
         self._buf = []
@@ -2394,6 +2470,15 @@ class WMR200(weewx.drivers.AbstractDevice):
         # Protocol recovery counters.
         self.protocol_resync_count = 0
         self.checksum_drop_count = 0
+
+        # gp9 protocol mode. Archive commands are now state-aware so a D1/D2
+        # seen during normal LIVE operation cannot accidentally start an
+        # archive-drain loop or grow PacketArchive.pkt_queue indefinitely.
+        self._protocol_mode = 'initializing'
+        self._archive_recovery_active = False
+        self.archive_ready_while_live_count = 0
+        self.archive_data_while_live_count = 0
+        self.archive_data_dropped_while_live_count = 0
 
         # Setup the generator to get a byte stream from the console.
         self.gen_byte = self._generate_bytestream
@@ -2417,6 +2502,16 @@ class WMR200(weewx.drivers.AbstractDevice):
             self.usb_device.timeout_warn_consecutive + 1,
             usb_timeout_error_consecutive)
         self.usb_device.health_interval = max(30.0, usb_health_interval)
+        self.usb_device.timeout_read = max(0.25, usb_read_slice_timeout)
+        self.usb_device.logical_timeout_interval = max(
+            self.usb_device.timeout_read, usb_logical_timeout_seconds)
+        self._developer_trace.event(
+            'CONFIG', 'usb_scheduler_config',
+            read_slice_seconds=self.usb_device.timeout_read,
+            logical_timeout_seconds=self.usb_device.logical_timeout_interval,
+            timeout_warn_consecutive=self.usb_device.timeout_warn_consecutive,
+            timeout_error_consecutive=self.usb_device.timeout_error_consecutive,
+            heartbeat_interval_seconds=_WMR200_REQUEST_LIVE_DATA_INTERVAL)
 
         # Locate the weather console device on the USB bus.
 #        if not self.usb_device.find_device(vendor_id, product_id):
@@ -2427,9 +2522,12 @@ class WMR200(weewx.drivers.AbstractDevice):
         # Open the weather console USB device for read and writes.
         self.usb_device.open_device(vendor_id, product_id)
 
-        # Initialize watchdog to poke device to request live
-        # data stream.
+        # Initialize watchdog to poke device to request live data stream.
+        # gp9 retains when and why the request was raised so developer traces
+        # can verify that USB reads no longer delay D0 for tens of seconds.
         self._rdy_to_poke = True
+        self._poke_requested_monotonic = time.monotonic()
+        self._poke_request_reason = 'startup'
 
         # Create the lock to sync between main thread and watchdog thread.
         self._poke_lock = threading.Lock()
@@ -2471,8 +2569,11 @@ class WMR200(weewx.drivers.AbstractDevice):
         if STAT_RESTART > 1:
             log.warning('Restart count: %d' % STAT_RESTART)
 
-        # Reset any other state during startup or after a crash.
+        # Reset any other state during startup or after a crash. Static
+        # packet queues must never leak records from an older driver instance.
         PacketArchiveData.rain_total_last = None
+        PacketArchive.pkt_queue[:] = []
+        PacketLive.pkt_queue[:] = []
 
         # Debugging flags
         global DEBUG_WRITES
@@ -2517,6 +2618,8 @@ class WMR200(weewx.drivers.AbstractDevice):
             log.debug('  USB read retries: %d' % self.usb_device.read_retries)
             log.debug('  USB retry delay: %.3f' % self.usb_device.retry_delay)
             log.debug('  USB reopen on failure: %s' % self.usb_device.reopen_on_failure)
+            log.debug('  USB read slice timeout: %.3f sec' % self.usb_device.timeout_read)
+            log.debug('  USB logical timeout: %.3f sec' % self.usb_device.logical_timeout_interval)
             log.debug('  Developer trace: %s' % self._developer_trace.enabled)
             log.debug('  Developer trace path: %s' % self._developer_trace.path)
             log.debug('  Driver file log: %s' % self._driver_file_log.enabled)
@@ -2548,34 +2651,69 @@ class WMR200(weewx.drivers.AbstractDevice):
         """Flag to drop rather than fail on checksum errors."""
         return self._ignore_checksum
 
-    def ready_to_poke(self, val):
-        """Set info that device is ready to be poked."""
-        self._poke_lock.acquire()
-        self._rdy_to_poke = val
-        self._poke_lock.release()
+    def ready_to_poke(self, val, reason=None):
+        """Set heartbeat request state and retain its scheduling latency."""
+        with self._poke_lock:
+            val = bool(val)
+            if val:
+                if not self._rdy_to_poke:
+                    self._poke_requested_monotonic = time.monotonic()
+                    self._poke_request_reason = reason or 'unspecified'
+                elif self._poke_requested_monotonic is None:
+                    self._poke_requested_monotonic = time.monotonic()
+                    self._poke_request_reason = reason or 'unspecified'
+                self._rdy_to_poke = True
+            else:
+                self._rdy_to_poke = False
+                self._poke_requested_monotonic = None
+                self._poke_request_reason = None
 
     def is_ready_to_poke(self):
         """Get info that device is ready to be poked."""
-        self._poke_lock.acquire()
-        val = self._rdy_to_poke
-        self._poke_lock.release()
-        return val
+        with self._poke_lock:
+            return self._rdy_to_poke
+
+    def _poke_request_snapshot(self):
+        """Return heartbeat request age/reason without holding the lock."""
+        with self._poke_lock:
+            requested = self._poke_requested_monotonic
+            reason = self._poke_request_reason
+        age = None
+        if requested is not None:
+            age = max(0.0, time.monotonic() - requested)
+        return age, reason
 
     def poll_usb_device_enable(self):
         """The USB thread calls this to enable data reads from the console."""
         return self._poll_device_enable
 
     def _write_cmd(self, cmd):
-        """Write a single command and preserve useful failure context."""
+        """Write a single command and preserve useful failure context.
+
+        Return wall time spent dispatching the command. gp9 records both this
+        and the lower-level USB lock wait so heartbeat latency is measurable.
+        """
         buf = [0x01, cmd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         command_names = {0xD0: 'heartbeat_live', 0xDA: 'request_archive',
                          0xDB: 'erase_archive', 0xDF: 'driver_shutdown'}
         self._developer_trace.event(
             'TX', 'protocol_command', data=buf,
             command='0x%02x' % cmd,
-            command_name=command_names.get(cmd, 'unknown'))
+            command_name=command_names.get(cmd, 'unknown'),
+            protocol_mode=self._protocol_mode)
+        started = time.monotonic()
         try:
-            self.usb_device.write_device(buf)
+            lock_wait_s = self.usb_device.write_device(buf)
+            elapsed_s = max(0.0, time.monotonic() - started)
+            self._developer_trace.event(
+                'TX', 'protocol_command_complete',
+                command='0x%02x' % cmd,
+                command_name=command_names.get(cmd, 'unknown'),
+                protocol_mode=self._protocol_mode,
+                elapsed_s=round(elapsed_s, 6),
+                usb_lock_wait_s=(round(lock_wait_s, 6)
+                                 if lock_wait_s is not None else None))
+            return elapsed_s
         except weewx.WeeWxIOError as exception:
             msg = ('_write_cmd() Unable to send USB cmd=0x%02x: %s' %
                    (cmd, exception))
@@ -2583,22 +2721,106 @@ class WMR200(weewx.drivers.AbstractDevice):
             raise weewx.WeeWxIOError(msg)
 
     def _poke_console(self):
-        """Send a heartbeat command to the weather console.
+        """Send the D0 live heartbeat and record scheduling latency."""
+        request_age_s, request_reason = self._poke_request_snapshot()
+        dispatch_started = time.monotonic()
+        self._developer_trace.event(
+            'TX', 'heartbeat_dispatch',
+            request_reason=request_reason,
+            request_age_s=(round(request_age_s, 6)
+                           if request_age_s is not None else None),
+            protocol_mode=self._protocol_mode)
+        write_elapsed_s = self._write_cmd(0xD0)
+        total_dispatch_s = max(0.0, time.monotonic() - dispatch_started)
 
-        This is used to inform the weather console to continue streaming
-        live data across the USB bus.  Otherwise it enters archive mode
-        were data is stored on the weather console."""
-        self._write_cmd(0xD0)
+        self._developer_trace.event(
+            'TX', 'heartbeat_sent',
+            request_reason=request_reason,
+            request_age_s=(round(request_age_s, 6)
+                           if request_age_s is not None else None),
+            write_elapsed_s=(round(write_elapsed_s, 6)
+                             if write_elapsed_s is not None else None),
+            dispatch_elapsed_s=round(total_dispatch_s, 6),
+            protocol_mode=self._protocol_mode)
 
         if self._erase_archive:
             self._write_cmd(0xDB)
             self._erase_archive = False
             log.warning('Console archive erase command sent once at startup')
 
-        # Reset the ready to poke flag.
+        # Reset the ready-to-poke flag only after a successful D0 write.
         self.ready_to_poke(False)
         if DEBUG_COMM:
             log.debug('Poked device for live data')
+
+    def _set_protocol_mode(self, mode, reason=None):
+        """Record protocol mode transitions used by archive state handling."""
+        previous = getattr(self, '_protocol_mode', None)
+        self._protocol_mode = str(mode)
+        if previous != self._protocol_mode:
+            self._developer_trace.event(
+                'STATE', 'protocol_mode_change',
+                previous_mode=previous,
+                new_mode=self._protocol_mode,
+                reason=reason)
+            log.info('WMR200 protocol mode %s -> %s reason=%s' %
+                     (previous, self._protocol_mode, reason))
+
+    def handle_archive_ready(self, packet_id=None):
+        """Handle D1 without allowing archive mode to leak into LIVE."""
+        if self._archive_recovery_active:
+            self._developer_trace.event(
+                'ARCHIVE', 'archive_ready_during_recovery',
+                packet_id=packet_id, protocol_mode=self._protocol_mode,
+                action='request_next_archive_record')
+            self.request_archive_data()
+            return
+
+        self.archive_ready_while_live_count += 1
+        self._developer_trace.event(
+            'ARCHIVE', 'archive_ready_while_live',
+            packet_id=packet_id, protocol_mode=self._protocol_mode,
+            total=self.archive_ready_while_live_count,
+            action='do_not_request_archive_reassert_live')
+        log.warning(
+            'Received archive-ready D1 outside startup recovery; '
+            'reasserting LIVE mode instead of requesting archive data')
+        self.ready_to_poke(True, reason='archive_ready_while_live')
+
+    def handle_archive_data_processed(self, pkt):
+        """Request the next D2 only while startup recovery is active."""
+        if self._archive_recovery_active:
+            self.request_archive_data()
+            return
+
+        self.archive_data_while_live_count += 1
+        record_ts = None
+        try:
+            record_ts = int(pkt.timestamp_record())
+        except Exception:
+            pass
+        self._developer_trace.event(
+            'ARCHIVE', 'archive_data_while_live',
+            packet_id=getattr(pkt, 'pkt_id', None),
+            record_ts=record_ts, protocol_mode=self._protocol_mode,
+            total=self.archive_data_while_live_count,
+            action='do_not_request_next_archive_reassert_live')
+        self.ready_to_poke(True, reason='archive_data_while_live')
+
+    def _drop_pending_archive_packets(self, reason):
+        """Discard stale D2 objects that must never accumulate in LIVE."""
+        dropped = len(PacketArchive.pkt_queue)
+        if dropped:
+            PacketArchive.pkt_queue[:] = []
+            self.archive_data_dropped_while_live_count += dropped
+            self._developer_trace.event(
+                'ARCHIVE', 'archive_queue_purged',
+                dropped=dropped, reason=reason,
+                protocol_mode=self._protocol_mode,
+                dropped_total=self.archive_data_dropped_while_live_count)
+            log.warning('Purged %d stale archive packet(s) while entering LIVE mode'
+                        % dropped)
+        return dropped
 
     def _resync_protocol_stream(self, gap_count, reason):
         """Abandon an incomplete protocol packet after USB bytes were lost.
@@ -2725,11 +2947,13 @@ class WMR200(weewx.drivers.AbstractDevice):
                     self._driver_file_log.writer_errors,
                     self._driver_file_log.path))
         log.info('USB recovery stats successful_reads:%d timeouts:%d '
-                 'timeout_bursts:%d max_consecutive_timeouts:%d '
+                 'poll_slice_timeouts:%d timeout_bursts:%d '
+                 'max_consecutive_timeouts:%d '
                  'read_pipe_stalls:%d write_transient_errors:%d '
                  'malformed_reports:%d reopens:%d'
                  % (self.usb_device.successful_read_count,
                     self.usb_device.read_timeout_count,
+                    self.usb_device.read_poll_timeout_count,
                     self.usb_device.timeout_burst_count,
                     self.usb_device.max_consecutive_read_timeouts,
                     self.usb_device.read_pipe_stall_count,
@@ -2741,6 +2965,12 @@ class WMR200(weewx.drivers.AbstractDevice):
                  % (self.protocol_resync_count,
                     self.checksum_drop_count,
                     self.usb_device.stream_gap_count))
+        log.info('Archive mode stats mode:%s active:%s ready_while_live:%d '
+                 'data_while_live:%d dropped_while_live:%d'
+                 % (self._protocol_mode, self._archive_recovery_active,
+                    self.archive_ready_while_live_count,
+                    self.archive_data_while_live_count,
+                    self.archive_data_dropped_while_live_count))
         log.info('Packet archive queue len:%d live queue len:%d'
                  % (len(PacketArchive.pkt_queue), len(PacketLive.pkt_queue)))
 
@@ -2857,9 +3087,26 @@ class WMR200(weewx.drivers.AbstractDevice):
                 log.debug('  Queuing live packet rx:%d live_queue_len:%d' %
                           (PacketLive.pkt_rx, len(PacketLive.pkt_queue)))
             elif self._pkt.packet_archive_data():
-                PacketArchive.pkt_queue.append(self._pkt)
-                log.debug('  Queuing archive packet rx:%d archive_queue_len:%d'
-                          % (PacketArchive.pkt_rx, len(PacketArchive.pkt_queue)))
+                if self._archive_recovery_active:
+                    PacketArchive.pkt_queue.append(self._pkt)
+                    log.debug(
+                        '  Queuing archive packet rx:%d archive_queue_len:%d'
+                        % (PacketArchive.pkt_rx, len(PacketArchive.pkt_queue)))
+                else:
+                    self.archive_data_dropped_while_live_count += 1
+                    record = self._pkt.packet_record()
+                    self._developer_trace.event(
+                        'ARCHIVE', 'archive_record_dropped_while_live',
+                        packet_id=self._pkt.pkt_id,
+                        record_ts=record.get('dateTime'),
+                        protocol_mode=self._protocol_mode,
+                        dropped_total=self.archive_data_dropped_while_live_count,
+                        action='drop_from_runtime_queue_reassert_live')
+                    log.warning(
+                        'Dropping archive D2 received outside startup recovery; '
+                        'packet_id=%d' % self._pkt.pkt_id)
+                    self.ready_to_poke(
+                        True, reason='archive_record_dropped_while_live')
             else:
                 log.debug(('  Acknowledged control packet rx:%d') % PacketControl.pkt_rx)
         except WMR200PacketParsingError as e:
@@ -2873,8 +3120,12 @@ class WMR200(weewx.drivers.AbstractDevice):
         """Main generator function that continuously returns loop packets
 
         weewx api to return live records."""
-        # Reset the current packet upon entry.
+        # Reset the current packet upon entry and make LIVE mode explicit.
         self._pkt = None
+        self._archive_recovery_active = False
+        self._set_protocol_mode('live', reason='genLoopPackets_entry')
+        self._drop_pending_archive_packets('genLoopPackets_entry')
+        self.ready_to_poke(True, reason='enter_live_mode')
 
         log.debug('genLoop() phase getting live packets')
 
@@ -2968,7 +3219,7 @@ class WMR200(weewx.drivers.AbstractDevice):
     def genStartupRecords(self, since_ts=0):
         """Present console archive packets on driver startup.
 
-        gp8 adds diagnostic accounting around the existing recovery algorithm.
+        gp8/gp9 add diagnostic accounting around the existing recovery algorithm.
         It does not clear the console archive. Every received archive record is
         classified in the developer trace as yielded, old, duplicate/out of
         order, threshold-rejected, or sub-minute. A sub-minute anomaly is now
@@ -3019,6 +3270,10 @@ class WMR200(weewx.drivers.AbstractDevice):
                         timespec='seconds')
             except (TypeError, ValueError, OverflowError, OSError):
                 return None
+
+        self._archive_recovery_active = True
+        self._set_protocol_mode(
+            'archive_recovery', reason='genStartupRecords_entry')
 
         self._developer_trace.event(
             'ARCHIVE', 'archive_recovery_start',
@@ -3266,6 +3521,11 @@ class WMR200(weewx.drivers.AbstractDevice):
                 last_yielded_utc=_utc_iso(last_yielded_ts),
                 data_span_seconds=data_span_s,
                 pending_archive_queue=len(PacketArchive.pkt_queue))
+            self._archive_recovery_active = False
+            self._set_protocol_mode(
+                'live_pending', reason='genStartupRecords_exit')
+            self.ready_to_poke(
+                True, reason='archive_recovery_complete')
 
     def closePort(self):
         """Closes the USB port to the device.
@@ -3315,6 +3575,7 @@ class WMR200(weewx.drivers.AbstractDevice):
             sent_bytes=self.usb_device.byte_cnt_wr,
             successful_reads=self.usb_device.successful_read_count,
             read_timeouts=self.usb_device.read_timeout_count,
+            poll_slice_timeouts=self.usb_device.read_poll_timeout_count,
             timeout_bursts=self.usb_device.timeout_burst_count,
             max_consecutive_timeouts=self.usb_device.max_consecutive_read_timeouts,
             read_pipe_stalls=self.usb_device.read_pipe_stall_count,
@@ -3323,7 +3584,12 @@ class WMR200(weewx.drivers.AbstractDevice):
             stream_gaps=self.usb_device.stream_gap_count,
             protocol_resyncs=self.protocol_resync_count,
             checksum_drops=self.checksum_drop_count,
-            reopens=self.usb_device.reopen_count)
+            reopens=self.usb_device.reopen_count,
+            protocol_mode=self._protocol_mode,
+            archive_ready_while_live=self.archive_ready_while_live_count,
+            archive_data_while_live=self.archive_data_while_live_count,
+            archive_data_dropped_while_live=(
+                self.archive_data_dropped_while_live_count))
         self._developer_trace.stop()
         log.info('Driver gracefully exiting')
         self._driver_file_log.stop()
@@ -3364,11 +3630,15 @@ class WMR200ConfEditor(weewx.drivers.AbstractConfEditor):
     ignore_checksum = False
     sensor_status = True
 
-    # USB recovery inherited from gp7-streamresync.
+    # USB recovery inherited from gp7-streamresync. gp9 uses short
+    # interrupt-read slices so the shared PyUSB lock cannot delay D0 for the
+    # old 15-second blocking-read window. Logical timeout health remains 15 s.
     usb_write_retries = 3
     usb_read_retries = 2
     usb_retry_delay = 0.5
     usb_reopen_on_failure = True
+    usb_read_slice_timeout = 2.0
+    usb_logical_timeout_seconds = 15
     usb_timeout_warn_consecutive = 2
     usb_timeout_error_consecutive = 4
     usb_health_interval = 300

@@ -12,7 +12,7 @@ class WMR200Installer(ExtensionInstaller):
 
     def __init__(self):
         super(WMR200Installer, self).__init__(
-            version="3.5.4-gp8-archive-trace",
+            version="3.5.4-gp9-live-scheduler",
             name='wmr200',
             description='WeeWX driver for the Oregon Scientific WMR200 station',
             author="Chris Manton; John E.P. Hynes; GP recovery hardening",
@@ -30,6 +30,8 @@ class WMR200Installer(ExtensionInstaller):
                     'usb_read_retries': '2',
                     'usb_retry_delay': '0.5',
                     'usb_reopen_on_failure': 'True',
+                    'usb_read_slice_timeout': '2.0',
+                    'usb_logical_timeout_seconds': '15',
                     'developer_trace': 'True',
                     'developer_trace_path': '/var/log/weewx/wmr200-developer-trace.jsonl',
                     'developer_trace_max_mb': '10',

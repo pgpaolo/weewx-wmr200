@@ -1,34 +1,41 @@
 # Changelog
 
-## 3.5.4-gp8-archive-trace
+## 3.5.4-gp9-live-scheduler
 
-Baseline: **3.5.4-gp7-streamresync**.
+Baseline: **3.5.4-gp8-archive-trace**.
 
 ### Added
 
-- Structured startup archive-recovery tracing.
-- Archive record classification: yielded, before requested timestamp, duplicate, out-of-order, threshold-exceeded and sub-minute.
-- Archive gap detection and accounting.
-- Final archive-recovery summary with counters, first/last timestamps and elapsed time.
-- Real asynchronous rotating `driver_file_log`.
-- Separate structured JSONL developer trace and textual DEBUG driver log.
-- Bounded diagnostic rotation: 10 MB per file, 4 backups by default.
+- 2-second interrupt-read scheduling slices to release the shared PyUSB lock frequently.
+- Separate 15-second logical communication-timeout accounting.
+- Heartbeat request-age and dispatch timing trace events.
+- USB control-write lock-wait measurements.
+- Explicit protocol modes: `initializing`, `archive_recovery`, `live_pending`, `live`.
+- Mode-aware D1/D2 archive handling.
+- Runtime archive-queue protection during LIVE mode.
+- `usb_scheduler_config`, `heartbeat_dispatch`, `heartbeat_sent`,
+  `archive_ready_while_live`, `archive_data_while_live`, and
+  `archive_record_dropped_while_live` trace events.
 
 ### Changed
 
-- A sub-minute malformed archive interval is dropped without aborting the complete startup recovery.
-- Documentation and default configuration updated for archive diagnostics.
-- `erase_archive = False` remains the recommended default.
+- A 2-second `interruptRead()` timeout is now a scheduling event
+  (`usb_poll_timeout`) and does not by itself increment communication-health timeout counters.
+- `usb_read_timeout` is emitted only after each 15-second continuous-silence boundary.
+- D1 requests D2 only while startup archive recovery is active.
+- D2 received during LIVE no longer requests another archive record and is not retained in `PacketArchive.pkt_queue`.
+- Static live/archive packet queues are cleared when a new driver instance starts.
 
-### Preserved from gp7-streamresync
+### Preserved from gp8
 
-- USB timeout classification and recovery.
-- EPIPE / interrupt endpoint stall handling.
-- Controlled USB reopen after repeated failures.
-- Protocol stream resynchronization after malformed HID reports.
-- Recoverable checksum packet drops.
-- Non-blocking structured developer tracing.
+- Decoder and sensor maps.
+- Checksum handling.
+- EPIPE / timeout retry and controlled reopen.
+- Malformed HID stream resynchronization.
+- Startup archive recovery diagnostics.
+- Asynchronous JSONL and text logging with bounded rotation.
 
-## 3.5.4-gp7-streamresync
+## 3.5.4-gp8-archive-trace
 
-Previous hardened baseline. Added protocol stream resynchronization and USB health/recovery diagnostics.
+Added detailed archive-recovery tracing, gap accounting, and asynchronous
+rotating driver-file logging on top of gp7-streamresync.
