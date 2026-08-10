@@ -1,41 +1,38 @@
 # Changelog
 
-## 3.5.4-gp9-live-scheduler
+## 3.5.4-gp10-archive-clock-recovery
 
-Baseline: **3.5.4-gp8-archive-trace**.
+Baseline: **3.5.4-gp9-live-scheduler**.
+
+### Fixed
+
+- Startup archive timeout is now measured with `time.monotonic()` so NTP/system-clock steps cannot expire catch-up early.
+- A multi-hour host/console drift captured before Raspberry Pi NTP synchronization is no longer accepted blindly.
+- Archive D2 records older than WeeWX `since_ts` are no longer misclassified as `out_of_order`; the database watermark and console sequence are separate concepts.
+- A sub-minute malformed archive timestamp no longer advances the archive sequence reference.
+- Interrupted startup recovery can retain its original catch-up watermark across a WeeWX driver restart.
 
 ### Added
 
-- 2-second interrupt-read scheduling slices to release the shared PyUSB lock frequently.
-- Separate 15-second logical communication-timeout accounting.
-- Heartbeat request-age and dispatch timing trace events.
-- USB control-write lock-wait measurements.
-- Explicit protocol modes: `initializing`, `archive_recovery`, `live_pending`, `live`.
-- Mode-aware D1/D2 archive handling.
-- Runtime archive-queue protection during LIVE mode.
-- `usb_scheduler_config`, `heartbeat_dispatch`, `heartbeat_sent`,
-  `archive_ready_while_live`, `archive_data_while_live`, and
-  `archive_record_dropped_while_live` trace events.
+- Configurable `archive_clock_drift_max` (default 900 s).
+- Configurable `archive_clock_wait` (default 180 s).
+- Persistent catch-up state with `archive_recovery_resume` and `archive_recovery_state_path`.
+- `archive_logger_interval = 0` auto-detection for historical D2 cadence, independent of the live `archive_interval`.
+- Clock/recovery trace events: `host_clock_not_ready`, `host_clock_ready`, `archive_clock_fallback_console_time`, `archive_recovery_resume`, `archive_recovery_state_cleared`, `archive_logger_interval_detected`.
+- Regression tests based on the observed 10-Aug-2026 failure pattern (large boot drift followed by NTP correction and older D2 records).
 
-### Changed
+### Preserved from gp9
 
-- A 2-second `interruptRead()` timeout is now a scheduling event
-  (`usb_poll_timeout`) and does not by itself increment communication-health timeout counters.
-- `usb_read_timeout` is emitted only after each 15-second continuous-silence boundary.
-- D1 requests D2 only while startup archive recovery is active.
-- D2 received during LIVE no longer requests another archive record and is not retained in `PacketArchive.pkt_queue`.
-- Static live/archive packet queues are cleared when a new driver instance starts.
+- 2-second USB read slices and 15-second logical timeout semantics.
+- Heartbeat scheduler and timing trace.
+- LIVE/ARCHIVE D1/D2 state handling.
+- Decoder, checksum handling, EPIPE/reopen and stream resynchronization.
+- Bounded asynchronous developer and text logs.
 
-### Preserved from gp8
+## 3.5.4-gp9-live-scheduler
 
-- Decoder and sensor maps.
-- Checksum handling.
-- EPIPE / timeout retry and controlled reopen.
-- Malformed HID stream resynchronization.
-- Startup archive recovery diagnostics.
-- Asynchronous JSONL and text logging with bounded rotation.
+Introduced short USB read slices, heartbeat latency diagnostics and mode-aware D1/D2 handling.
 
 ## 3.5.4-gp8-archive-trace
 
-Added detailed archive-recovery tracing, gap accounting, and asynchronous
-rotating driver-file logging on top of gp7-streamresync.
+Added detailed archive-recovery tracing, gap accounting and asynchronous rotating driver logging.

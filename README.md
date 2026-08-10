@@ -1,36 +1,37 @@
 # WeeWX WMR200 Hardened Driver
 
-Advanced USB driver for **Oregon Scientific WMR200 / WMR200A** weather-station consoles, designed for **WeeWX 4 and WeeWX 5**.
+Advanced USB driver for **Oregon Scientific WMR200 / WMR200A** consoles, designed for WeeWX 4/5 and Raspberry Pi deployments.
 
-> **Driver version:** `3.5.4-gp9-live-scheduler`  
-> **Baseline:** `3.5.4-gp8-archive-trace`  
+> **Driver version:** `3.5.4-gp10-archive-clock-recovery`  
+> **Baseline:** `3.5.4-gp9-live-scheduler`  
 > **Status:** community project; not officially supported by the WeeWX project.
 
-## Why gp9
+## Why gp10
 
-A gp8 diagnostic trace showed that the shared PyUSB lock could be held by a
-15-second blocking `interruptRead()`, delaying D0 live heartbeats by many
-seconds. gp9 keeps the gp8 recovery/parser logic but changes the USB scheduler:
+gp10 is a field-driven archive-recovery release. A real Raspberry Pi boot showed that WeeWX can start before networking/NTP has corrected the system clock. gp9 cached the first host/console drift and used wall-clock time inside startup recovery. A later NTP step could therefore terminate catch-up early and historical D2 records could be discarded or misclassified.
 
-- `interruptRead()` runs in **2-second slices**;
-- a slice timeout is only `usb_poll_timeout`, not a communication fault;
-- health still counts one logical `usb_read_timeout` every **15 seconds of continuous silence**;
-- D0 request age, command elapsed time, and USB lock wait are traced;
-- D1/D2 archive commands are state-aware;
-- archive drain continues only during `genStartupRecords()`;
-- D1/D2 received during normal LIVE mode do not start a new archive-drain chain;
-- late D2 records in LIVE are traced and dropped from the runtime archive queue.
+gp10 keeps the validated gp9 live USB scheduler and adds a clock-safe archive state machine:
 
-## Preserved from gp8
+- startup recovery quiet timers use **`time.monotonic()` only**;
+- implausible first host/console drift samples are rejected;
+- the driver keeps sampling until the host clock becomes plausible;
+- after a configurable wait, recovery falls back to **native WMR200 timestamps** instead of applying a bogus multi-hour drift;
+- archive ordering is based on consecutive D2 records, never on the WeeWX database watermark;
+- `since_ts` is used only as the catch-up boundary;
+- interrupted catch-up can resume from its original watermark using a small persistent state file;
+- historical D2 logger cadence can be auto-detected independently of the 60-second live WeeWX archive interval.
 
-- WMR200 packet decoder and sensor mappings;
-- checksum verification and recoverable packet drop;
-- EPIPE / timeout recovery;
-- controlled USB handle reopen;
-- malformed-HID protocol stream resynchronization;
-- structured JSONL developer trace;
-- asynchronous rotating textual driver log;
-- startup archive-recovery diagnostics and gap accounting.
+## Preserved from gp9
+
+- 2-second USB read slices with a 15-second logical communication timeout;
+- D0 heartbeat latency tracing;
+- state-aware D1/D2 handling in LIVE mode;
+- checksum handling;
+- EPIPE / timeout recovery and controlled reopen;
+- malformed-HID stream resynchronization;
+- sensor mappings and packet decoder;
+- asynchronous rotating JSONL developer trace;
+- asynchronous rotating textual driver log.
 
 ## Recommended configuration
 
@@ -47,7 +48,14 @@ seconds. gp9 keeps the gp8 recovery/parser logic but changes the USB scheduler:
     ignore_checksum = False
     sensor_status = True
 
-    # USB recovery / gp9 scheduler
+    # gp10 archive / boot-clock hardening
+    archive_clock_drift_max = 900
+    archive_clock_wait = 180
+    archive_recovery_resume = True
+    archive_recovery_state_path = /var/lib/weewx/wmr200-archive-recovery.json
+    archive_logger_interval = 0
+
+    # USB recovery / gp9 scheduler retained by gp10
     usb_write_retries = 3
     usb_read_retries = 2
     usb_retry_delay = 0.5
@@ -67,7 +75,7 @@ seconds. gp9 keeps the gp8 recovery/parser logic but changes the USB scheduler:
     developer_trace_include_timeouts = True
     developer_trace_include_packets = True
 
-    # Complete asynchronous textual driver log
+    # Complete asynchronous driver text log
     driver_file_log = True
     driver_file_log_path = /var/log/weewx/wmr200-debug.log
     driver_file_log_level = DEBUG
@@ -77,82 +85,42 @@ seconds. gp9 keeps the gp8 recovery/parser logic but changes the USB scheduler:
     [[sensor_map]]
 ```
 
-Each diagnostic family is bounded to **one active file plus four backups**:
-5 files maximum, approximately 50 MB per family with the defaults above.
+`archive_logger_interval = 0` means auto-detect the interval of historical D2 records. It does **not** change the driver's `archive_interval = 60` exposed to WeeWX for normal live archiving.
 
-## Repository layout
+## Important gp10 trace events
 
-```text
-bin/user/wmr200.py
-                    Main WeeWX driver
+- `host_clock_not_ready`
+- `host_clock_ready`
+- `archive_clock_fallback_console_time`
+- `archive_recovery_resume`
+- `archive_recovery_state_cleared`
+- `archive_logger_interval_detected`
+- `archive_recovery_start`
+- `archive_record_evaluated`
+- `archive_recovery_complete`
+- all gp9 USB scheduler events (`usb_poll_timeout`, `usb_read_timeout`, `heartbeat_sent`, etc.)
 
-docs/
-                    Installation, diagnostics, testing and upgrade notes
+## Installation
 
-util/udev/rules.d/
-                    Linux udev rule for WMR200 USB access/autosuspend
-
-install.py
-                    WeeWX ExtensionInstaller definition
-
-README.md
-CHANGELOG.md
-changelog
+```bash
+sudo ./install.sh
 ```
 
-## Install as a WeeWX extension
+or as a WeeWX extension:
 
 ```bash
 sudo weectl extension install .
 sudo weectl station reconfigure --driver=user.wmr200
 ```
 
-Install the supplied udev rule when required:
-
-```bash
-sudo cp util/udev/rules.d/wmr200.rules /etc/udev/rules.d/99-wmr200.rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-```
-
-See [docs/INSTALLAZIONE-IT.md](docs/INSTALLAZIONE-IT.md) for the complete
-procedure.
-
-## Diagnostics
-
-Structured trace:
-
-```text
-/var/log/weewx/wmr200-developer-trace.jsonl
-```
-
-Text driver log:
-
-```text
-/var/log/weewx/wmr200-debug.log
-```
-
-Important gp9 events include:
-
-- `usb_scheduler_config`
-- `usb_poll_timeout`
-- `usb_read_timeout`
-- `heartbeat_dispatch`
-- `heartbeat_sent`
-- `protocol_mode_change`
-- `archive_ready_while_live`
-- `archive_data_while_live`
-- `archive_record_dropped_while_live`
-- `archive_recovery_complete`
+See `INSTALLAZIONE-IT.md` and `UPGRADE-GP9-TO-GP10-IT.md` for the complete procedure.
 
 ## Safety
 
-The recommended configuration keeps:
+Keep:
 
 ```ini
 erase_archive = False
 ```
 
-so the console archive is not intentionally erased during normal startup
-recovery. Diagnostic writers are asynchronous and best-effort so log failures
-are designed not to propagate into weather acquisition.
+during validation. gp10 does not intentionally erase the console logger during normal catch-up.

@@ -1,57 +1,40 @@
-# Test consigliato gp9
+# Test consigliato gp10
 
-## 1. Test LIVE / heartbeat
-
-Lasciare WeeWX attivo almeno alcune ore:
+## 1. Test automatici
 
 ```bash
-sudo ./check-install.sh
-sudo ./tools/trace-summary.py /var/log/weewx/wmr200-developer-trace.jsonl\*
+python3 -m py_compile bin/user/wmr200.py
+for t in tests/test_*.py; do python3 "$t" || exit 1; done
 ```
 
-Controllare in particolare:
+I test gp10 includono:
 
-- assenza di reopen USB ripetuti;
-- `usb_poll_timeout` può comparire ed è un normale timeout della finestra corta;
-- `usb_read_timeout` deve comparire solo dopo almeno ~15 s di silenzio continuo;
-- `heartbeat_sent.request_age_s` e `usb_control_write.lock_wait_s` devono restare
-  normalmente bassi e non mostrare più ritardi dell'ordine di 15-30 secondi;
-- D1 durante LIVE deve produrre `archive_ready_while_live`, non una catena DA/D2;
-- la coda archive deve restare a zero durante LIVE.
+- rigetto del drift reale anomalo `-48993 s`;
+- successiva accettazione di un drift plausibile `13 s` dopo NTP;
+- separazione `since_ts` / sequenza D2;
+- fallback a timestamp console;
+- resume da watermark persistente;
+- regressioni USB gp9, checksum, EPIPE/reopen, stream resync e rotazione log.
 
-## 2. Test recupero storico
+## 2. Test hardware NTP
 
-Con `erase_archive = False`:
-
-1. annotare l'ultimo timestamp presente nel database;
-2. fermare WeeWX lasciando la console WMR200 alimentata;
-3. attendere 30-60 minuti (o più per un test reale);
-4. riavviare WeeWX;
-5. attendere il completamento di `genStartupRecords()`;
-6. eseguire:
+1. `sudo systemctl stop weewx`.
+2. Lascia la WMR200 accesa almeno 30–60 minuti.
+3. Riavvia il Raspberry con rete inizialmente non disponibile oppure con NTP ritardato.
+4. Fai arrivare la rete e lascia sincronizzare NTP.
+5. Attendi la fine del catch-up.
+6. Controlla:
 
 ```bash
-sudo ./tools/trace-summary.py /var/log/weewx/wmr200-developer-trace.jsonl\*
+grep -E 'host_clock_|archive_clock_|archive_recovery|archive_record_evaluated' /var/log/weewx/wmr200-developer-trace.jsonl
 ```
 
-Verificare `archive_recovery_complete`, i record ricevuti/consegnati e gli
-eventuali gap. Durante questa fase D1/D2 devono essere gestiti normalmente
-perché il protocol mode è `archive_recovery`.
+7. Verifica SQLite sul periodo di fermo.
 
-## 3. Test ritorno a LIVE
+## 3. Criteri di successo
 
-Dopo il recupero storico verificare nel trace:
-
-```text
-protocol_mode_change -> live_pending
-protocol_mode_change -> live
-```
-
-Eventuali D2 tardivi devono essere classificati come
-`archive_record_dropped_while_live` e non devono accumularsi nella coda.
-
-## 4. Raccolta diagnostica
-
-```bash
-sudo ./collect-debug.sh --hours 24
-```
+- nessuna chiusura catch-up causata da salto dell'orologio;
+- nessun `out_of_order` solo perché il D2 è precedente a `since_ts`;
+- record storici `yielded` presenti nel DB;
+- state file cancellato a drain completato;
+- gp9 scheduler ancora stabile: niente regressioni di heartbeat/USB.

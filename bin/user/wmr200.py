@@ -55,7 +55,7 @@ import weewx.drivers
 import weeutil.weeutil
 
 DRIVER_NAME = 'WMR200'
-DRIVER_VERSION = "3.5.4-gp9-live-scheduler"
+DRIVER_VERSION = "3.5.4-gp10-archive-clock-recovery"
 
 log = logging.getLogger(__name__)
 
@@ -1442,14 +1442,20 @@ class PacketLive(Packet):
         self._record.update({'dateTime': self.timestamp_live(), })
 
     def calc_time_drift(self):
-        """Returns the difference between PC time and the packet timestamp.
-        This value is approximate as all timestamps from a given archive
-        interval will be the same while PC time marches onwards.
-        Only done once upon first live packet received."""
-        if self.wmr200.time_drift is None:
-            self.wmr200.time_drift = self.timestamp_host() \
-                - self.timestamp_packet()
-            log.info('Time drift between host and console in seconds:%d' % self.wmr200.time_drift)
+        """Offer a host/console drift sample to the gp10 clock gate.
+
+        Raspberry Pi systems can boot before NTP has corrected the host clock.
+        gp10 therefore does not blindly cache the first drift sample.  The
+        driver validates it and keeps sampling until the host clock becomes
+        plausible, or archive recovery explicitly falls back to console time.
+        """
+        host_ts = self.timestamp_host()
+        console_ts = self.timestamp_packet()
+        self.wmr200.consider_time_drift(
+            host_ts - console_ts,
+            host_ts=host_ts,
+            console_ts=console_ts,
+            packet_id=getattr(self, 'pkt_id', None))
 
     def timestamp_live(self):
         """Returns the timestamp from a live packet.
@@ -2394,8 +2400,29 @@ class WMR200(weewx.drivers.AbstractDevice):
         self._ignore_checksum = \
                 weeutil.weeutil.tobool(stn_dict.get('ignore_checksum', False))
 
-        # Archive startup time in seconds.
+        # Archive startup quiet time in seconds. gp10 measures this with
+        # time.monotonic(), so an NTP clock step cannot expire recovery early.
         self._archive_startup = int(stn_dict.get('archive_startup', 120))
+
+        # gp10 archive/clock recovery controls.  A large first host/console
+        # drift is typical on Raspberry Pi systems that boot before NTP is
+        # available.  Reject implausible drift until the host clock settles;
+        # after archive_clock_wait seconds, preserve data by falling back to
+        # the WMR200 console timestamps instead of applying a bogus offset.
+        self._archive_clock_drift_max = int(stn_dict.get(
+            'archive_clock_drift_max', 900))
+        self._archive_clock_wait = int(stn_dict.get(
+            'archive_clock_wait', 180))
+        self._archive_recovery_resume = weeutil.weeutil.tobool(
+            stn_dict.get('archive_recovery_resume', True))
+        self._archive_recovery_state_path = stn_dict.get(
+            'archive_recovery_state_path',
+            '/var/lib/weewx/wmr200-archive-recovery.json')
+        # 0 = auto-detect the cadence of D2 logger records.  This is kept
+        # separate from archive_interval, which remains the WeeWX live archive
+        # interval exposed by the driver.
+        self._archive_logger_interval = int(stn_dict.get(
+            'archive_logger_interval', 0))
 
         # Non-blocking developer trace. Enabled by default in this diagnostic build.
         developer_trace_enabled = weeutil.weeutil.tobool(
@@ -2432,6 +2459,11 @@ class WMR200(weewx.drivers.AbstractDevice):
             version=DRIVER_VERSION, model=self._model,
             erase_archive=self._erase_archive,
             archive_interval=self._archive_interval,
+            archive_clock_drift_max=self._archive_clock_drift_max,
+            archive_clock_wait=self._archive_clock_wait,
+            archive_recovery_resume=self._archive_recovery_resume,
+            archive_recovery_state_path=self._archive_recovery_state_path,
+            archive_logger_interval=self._archive_logger_interval,
             driver_file_log=self._driver_file_log.enabled,
             driver_file_log_path=self._driver_file_log.path)
 
@@ -2479,12 +2511,18 @@ class WMR200(weewx.drivers.AbstractDevice):
         self.archive_ready_while_live_count = 0
         self.archive_data_while_live_count = 0
         self.archive_data_dropped_while_live_count = 0
+        self.live_suppressed_during_archive_recovery_count = 0
 
         # Setup the generator to get a byte stream from the console.
         self.gen_byte = self._generate_bytestream
 
         # Calculate time delta in seconds between host and console.
         self.time_drift = None
+        self._time_drift_last_candidate = None
+        self._time_drift_rejected_count = 0
+        self._time_drift_last_warning_monotonic = None
+        self._archive_clock_fallback = False
+        self._detected_archive_logger_interval = None
 
         # Create USB accessor to communiate with weather console device.
         self.usb_device = UsbDevice(trace=self._developer_trace)
@@ -2752,6 +2790,152 @@ class WMR200(weewx.drivers.AbstractDevice):
         self.ready_to_poke(False)
         if DEBUG_COMM:
             log.debug('Poked device for live data')
+
+    def consider_time_drift(self, candidate, host_ts=None, console_ts=None,
+                            packet_id=None):
+        """Validate a host/console clock-drift sample before using it.
+
+        gp9 accepted the first sample unconditionally. On a Raspberry Pi that
+        starts before NTP, that can be many hours wrong. gp10 keeps ``None``
+        until a plausible sample arrives. Archive recovery can later choose a
+        documented console-time fallback if NTP never becomes available.
+        """
+        try:
+            candidate = int(round(float(candidate)))
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+        self._time_drift_last_candidate = candidate
+        limit = max(1, int(getattr(self, '_archive_clock_drift_max', 900)))
+
+        if abs(candidate) <= limit:
+            previous = self.time_drift
+            if previous is None or getattr(self, '_archive_clock_fallback', False):
+                self.time_drift = candidate
+                self._archive_clock_fallback = False
+                self._developer_trace.event(
+                    'CLOCK', 'host_clock_ready',
+                    candidate_drift_seconds=candidate,
+                    previous_drift_seconds=previous,
+                    max_accepted_drift_seconds=limit,
+                    host_ts=host_ts,
+                    console_ts=console_ts,
+                    packet_id=packet_id,
+                    rejected_samples=self._time_drift_rejected_count,
+                    action='accept_time_drift')
+                log.info('Time drift between host and console in seconds:%d' %
+                         self.time_drift)
+            return True
+
+        # Do not overwrite an already accepted drift during normal operation,
+        # but report a large new sample. During startup this path normally runs
+        # while time_drift is still None and waits for NTP to settle.
+        self._time_drift_rejected_count += 1
+        now_mono = time.monotonic()
+        warn_last = self._time_drift_last_warning_monotonic
+        should_report = (warn_last is None or now_mono - warn_last >= 30.0)
+        if should_report:
+            self._time_drift_last_warning_monotonic = now_mono
+            self._developer_trace.event(
+                'CLOCK', 'host_clock_not_ready',
+                candidate_drift_seconds=candidate,
+                max_accepted_drift_seconds=limit,
+                host_ts=host_ts,
+                console_ts=console_ts,
+                packet_id=packet_id,
+                rejected_samples=self._time_drift_rejected_count,
+                time_drift=self.time_drift,
+                action='reject_drift_and_wait_for_clock_sync')
+            log.warning(
+                'Host clock not yet plausible for archive adjustment: '
+                'candidate drift=%d sec limit=%d sec; waiting for clock sync' %
+                (candidate, limit))
+        return False
+
+    def _archive_recovery_state_load(self):
+        """Best-effort load of an interrupted archive-recovery watermark."""
+        if not getattr(self, '_archive_recovery_resume', False):
+            return None
+        path = getattr(self, '_archive_recovery_state_path', None)
+        if not path:
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                state = json.load(handle)
+            if not isinstance(state, dict) or not state.get('active'):
+                return None
+            saved = int(state.get('since_ts', 0))
+            return state if saved >= 0 else None
+        except FileNotFoundError:
+            return None
+        except Exception as exception:
+            self._developer_trace.event(
+                'ARCHIVE', 'archive_recovery_state_read_error',
+                path=path, reason=str(exception), action='ignore_state_file')
+            log.warning('Unable to read archive recovery state %s: %s' %
+                        (path, exception))
+            return None
+
+    def _archive_recovery_state_save(self, since_ts):
+        """Atomically remember the catch-up origin until recovery completes."""
+        if not getattr(self, '_archive_recovery_resume', False):
+            return False
+        path = getattr(self, '_archive_recovery_state_path', None)
+        if not path:
+            return False
+        tmp_path = '%s.tmp' % path
+        payload = {
+            'active': True,
+            'since_ts': int(since_ts),
+            'driver_version': DRIVER_VERSION,
+        }
+        try:
+            parent = os.path.dirname(path)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            with open(tmp_path, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.write('\n')
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp_path, path)
+            return True
+        except Exception as exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+            self._developer_trace.event(
+                'ARCHIVE', 'archive_recovery_state_write_error',
+                path=path, since_ts=int(since_ts), reason=str(exception),
+                action='continue_without_persistent_resume')
+            log.warning('Unable to persist archive recovery state %s: %s' %
+                        (path, exception))
+            return False
+
+    def _archive_recovery_state_clear(self):
+        """Clear the persistent watermark only after a completed drain."""
+        if not getattr(self, '_archive_recovery_resume', False):
+            return
+        path = getattr(self, '_archive_recovery_state_path', None)
+        if not path:
+            return
+        try:
+            os.unlink(path)
+            self._developer_trace.event(
+                'ARCHIVE', 'archive_recovery_state_cleared', path=path)
+        except FileNotFoundError:
+            pass
+        except Exception as exception:
+            self._developer_trace.event(
+                'ARCHIVE', 'archive_recovery_state_clear_error',
+                path=path, reason=str(exception))
+            log.warning('Unable to clear archive recovery state %s: %s' %
+                        (path, exception))
 
     def _set_protocol_mode(self, mode, reason=None):
         """Record protocol mode transitions used by archive state handling."""
@@ -3083,9 +3267,24 @@ class WMR200(weewx.drivers.AbstractDevice):
                     packet_name=self._pkt.pkt_name,
                     record=self._pkt.packet_record())
             if self._pkt.packet_live_data():
-                PacketLive.pkt_queue.append(self._pkt)
-                log.debug('  Queuing live packet rx:%d live_queue_len:%d' %
-                          (PacketLive.pkt_rx, len(PacketLive.pkt_queue)))
+                if self._archive_recovery_active:
+                    # Live packets are still decoded so they can provide a
+                    # fresh host/console drift sample, but gp10 does not queue
+                    # them for later LOOP delivery. Otherwise pre-NTP packets
+                    # captured during a long startup catch-up could be emitted
+                    # after recovery with stale/wrong host timestamps.
+                    self.live_suppressed_during_archive_recovery_count += 1
+                    self._developer_trace.event(
+                        'ARCHIVE',
+                        'live_packet_suppressed_during_archive_recovery',
+                        packet_id=self._pkt.pkt_id,
+                        packet_name=self._pkt.pkt_name,
+                        total=self.live_suppressed_during_archive_recovery_count,
+                        action='use_for_clock_sample_but_do_not_queue_loop')
+                else:
+                    PacketLive.pkt_queue.append(self._pkt)
+                    log.debug('  Queuing live packet rx:%d live_queue_len:%d' %
+                              (PacketLive.pkt_rx, len(PacketLive.pkt_queue)))
             elif self._pkt.packet_archive_data():
                 if self._archive_recovery_active:
                     PacketArchive.pkt_queue.append(self._pkt)
@@ -3217,37 +3416,74 @@ class WMR200(weewx.drivers.AbstractDevice):
                     log.info('genArchive() Ignoring received archive record before requested timestamp')
 
     def genStartupRecords(self, since_ts=0):
-        """Present console archive packets on driver startup.
+        """Present WMR200 logger records during WeeWX startup catch-up.
 
-        gp8/gp9 add diagnostic accounting around the existing recovery algorithm.
-        It does not clear the console archive. Every received archive record is
-        classified in the developer trace as yielded, old, duplicate/out of
-        order, threshold-rejected, or sub-minute. A sub-minute anomaly is now
-        dropped locally instead of terminating the entire startup recovery.
+        gp10 hardens the archive path for Raspberry Pi boots where the system
+        clock is corrected only after networking/NTP becomes available:
+
+        * recovery quiet-time uses ``time.monotonic()`` only;
+        * implausible first host/console drift samples are rejected;
+        * if clock sync never arrives, console timestamps are preserved rather
+          than applying a bogus multi-hour drift;
+        * archive sequence ordering is based on archive records, never on the
+          database ``since_ts`` watermark;
+        * an interrupted recovery can resume from its original watermark using
+          a small best-effort state file.
         """
-        log.debug('genStartup() phase getting archive packets since %s'
-                  % weeutil.weeutil.timestamp_to_string(since_ts))
-
-        # Reset the current packet upon entry.
-        self._pkt = None
-
-        # Time after last archive packet to indicate there are likely no more
-        # archive packets left to drain.
-        timestamp_last_archive_rx = int(time.time() + 0.5)
-
-        # Statistics used by the original code and by gp8 diagnostics.
-        timestamp_packet_first = None
-        timestamp_packet_current = None
-        timestamp_packet_previous = None
-        cnt = 0
-
+        requested_since_ts = 0 if since_ts is None else int(since_ts)
         if since_ts is None:
             log.info('genStartup() Database initialization')
-            since_ts = 0
-        since_ts = int(since_ts)
+
+        # Resume an interrupted catch-up if gp10 previously saved an older
+        # origin. WeeWX itself passes MAX(dateTime) as since_ts, so without this
+        # protection a crash after live records have entered the DB can hide an
+        # older hole forever.
+        effective_since_ts = requested_since_ts
+        resume_state = self._archive_recovery_state_load()
+        resume_used = False
+        if resume_state:
+            try:
+                saved_since_ts = int(resume_state.get('since_ts', 0))
+            except (TypeError, ValueError):
+                saved_since_ts = requested_since_ts
+            # Ignore a clearly stale/corrupt state watermark. archive_threshold
+            # already represents the maximum historical span we are willing to
+            # trust in the original driver.
+            if (saved_since_ts <= requested_since_ts and
+                    requested_since_ts - saved_since_ts <= self._archive_threshold):
+                effective_since_ts = saved_since_ts
+                resume_used = saved_since_ts < requested_since_ts
+                if resume_used:
+                    log.warning(
+                        'genStartup() Resuming interrupted archive recovery '
+                        'from %s instead of current DB tail %s' %
+                        (weeutil.weeutil.timestamp_to_string(saved_since_ts),
+                         weeutil.weeutil.timestamp_to_string(requested_since_ts)))
+                    self._developer_trace.event(
+                        'ARCHIVE', 'archive_recovery_resume',
+                        requested_since_ts=requested_since_ts,
+                        effective_since_ts=effective_since_ts,
+                        state_path=self._archive_recovery_state_path,
+                        action='resume_original_catchup_watermark')
+
+        # Remember the effective origin before talking to the console. The file
+        # is cleared only after a normal archive-drained exit.
+        self._archive_recovery_state_save(effective_since_ts)
+
+        log.debug('genStartup() phase getting archive packets since %s'
+                  % weeutil.weeutil.timestamp_to_string(effective_since_ts))
+
+        self._pkt = None
 
         recovery_started_monotonic = time.monotonic()
+        timestamp_last_archive_rx_monotonic = recovery_started_monotonic
         recovery_outcome = 'consumer_closed'
+
+        timestamp_packet_first = None
+        timestamp_packet_current = None
+        timestamp_archive_previous = None
+        cnt = 0
+
         archive_received = 0
         archive_before_since = 0
         archive_duplicate = 0
@@ -3260,6 +3496,16 @@ class WMR200(weewx.drivers.AbstractDevice):
         first_yielded_ts = None
         last_yielded_ts = None
         drift_wait_reported = False
+        clock_fallback_reported = False
+
+        configured_logger_interval = max(
+            0, int(getattr(self, '_archive_logger_interval', 0)))
+        detected_logger_interval = (
+            configured_logger_interval if configured_logger_interval > 0
+            else None)
+        logger_interval_candidate = None
+        logger_interval_candidate_hits = 0
+        self._detected_archive_logger_interval = detected_logger_interval
 
         def _utc_iso(epoch_value):
             if epoch_value is None:
@@ -3271,17 +3517,50 @@ class WMR200(weewx.drivers.AbstractDevice):
             except (TypeError, ValueError, OverflowError, OSError):
                 return None
 
+        def _maybe_clock_fallback(now_monotonic):
+            """Use console time if NTP has not supplied a plausible clock."""
+            nonlocal clock_fallback_reported
+            if not self.use_pc_time or self.time_drift is not None:
+                return
+            wait_seconds = max(
+                0, int(getattr(self, '_archive_clock_wait', 180)))
+            elapsed = max(0.0, now_monotonic - recovery_started_monotonic)
+            if elapsed < wait_seconds:
+                return
+            self.time_drift = 0
+            self._archive_clock_fallback = True
+            if not clock_fallback_reported:
+                clock_fallback_reported = True
+                self._developer_trace.event(
+                    'CLOCK', 'archive_clock_fallback_console_time',
+                    waited_seconds=round(elapsed, 3),
+                    configured_wait_seconds=wait_seconds,
+                    last_rejected_drift_seconds=self._time_drift_last_candidate,
+                    rejected_samples=self._time_drift_rejected_count,
+                    action='preserve_console_timestamps_without_host_drift')
+                log.warning(
+                    'Host clock did not become plausible within %d sec; '
+                    'archive recovery will preserve native WMR200 timestamps '
+                    'with zero drift for this recovery' % wait_seconds)
+
         self._archive_recovery_active = True
         self._set_protocol_mode(
             'archive_recovery', reason='genStartupRecords_entry')
 
         self._developer_trace.event(
             'ARCHIVE', 'archive_recovery_start',
-            since_ts=since_ts,
-            since_utc=_utc_iso(since_ts),
+            requested_since_ts=requested_since_ts,
+            requested_since_utc=_utc_iso(requested_since_ts),
+            since_ts=effective_since_ts,
+            since_utc=_utc_iso(effective_since_ts),
+            resume_used=resume_used,
             archive_interval=self._archive_interval,
+            archive_logger_interval=configured_logger_interval,
             archive_startup=self._archive_startup,
             archive_threshold=self._archive_threshold,
+            archive_clock_drift_max=getattr(
+                self, '_archive_clock_drift_max', 900),
+            archive_clock_wait=getattr(self, '_archive_clock_wait', 180),
             use_pc_time=self.use_pc_time,
             time_drift=self.time_drift,
             erase_archive=self._erase_archive,
@@ -3296,26 +3575,38 @@ class WMR200(weewx.drivers.AbstractDevice):
                     self._poke_console()
 
                 self._poll_for_data()
+                now_monotonic = time.monotonic()
+                _maybe_clock_fallback(now_monotonic)
 
                 while PacketArchive.pkt_queue:
-                    timestamp_last_archive_rx = int(time.time() + 0.5)
+                    # The last-archive timer is monotonic. An NTP step cannot
+                    # turn 10 seconds of runtime into 13 hours.
+                    timestamp_last_archive_rx_monotonic = time.monotonic()
 
-                    # PC-time mode needs one live timestamp to calculate the
-                    # console/host drift before archive timestamps are adjusted.
                     if self.use_pc_time and self.time_drift is None:
                         if not drift_wait_reported:
                             self._developer_trace.event(
-                                'ARCHIVE', 'archive_recovery_waiting_for_time_drift',
+                                'ARCHIVE',
+                                'archive_recovery_waiting_for_time_drift',
                                 queued_records=len(PacketArchive.pkt_queue),
-                                action='retain_archive_queue_until_live_timestamp')
+                                candidate_drift_seconds=
+                                    self._time_drift_last_candidate,
+                                max_accepted_drift_seconds=getattr(
+                                    self, '_archive_clock_drift_max', 900),
+                                action='retain_archive_queue_until_clock_ready')
                             drift_wait_reported = True
-                        log.info('genStartup() Delaying archive packet processing until live packet received')
-                        break
+                        log.info(
+                            'genStartup() Delaying archive packet processing '
+                            'until host clock is plausible')
+                        _maybe_clock_fallback(time.monotonic())
+                        if self.time_drift is None:
+                            break
 
                     if drift_wait_reported:
                         self._developer_trace.event(
                             'ARCHIVE', 'archive_recovery_time_drift_ready',
                             time_drift=self.time_drift,
+                            clock_fallback=getattr(self, '_archive_clock_fallback', False),
                             queued_records=len(PacketArchive.pkt_queue))
                         drift_wait_reported = False
 
@@ -3330,16 +3621,19 @@ class WMR200(weewx.drivers.AbstractDevice):
                     if timestamp_packet_first is None:
                         timestamp_packet_first = current_ts
 
-                    if timestamp_packet_previous is None:
-                        timestamp_packet_previous = (
-                            current_ts if since_ts == 0 else since_ts)
-
-                    previous_ts = int(timestamp_packet_previous)
-                    timestamp_packet_interval = current_ts - previous_ts
+                    previous_ts = (int(timestamp_archive_previous)
+                                   if timestamp_archive_previous is not None
+                                   else None)
+                    timestamp_packet_interval = (
+                        current_ts - previous_ts
+                        if previous_ts is not None else None)
                     disposition = None
                     gap_seconds = 0
 
-                    if timestamp_packet_interval < 1:
+                    # Ordering is strictly archive-record-to-archive-record.
+                    # since_ts is only the database catch-up watermark.
+                    if (timestamp_packet_interval is not None and
+                            timestamp_packet_interval <= 0):
                         if timestamp_packet_interval == 0:
                             archive_duplicate += 1
                             disposition = 'duplicate'
@@ -3348,12 +3642,13 @@ class WMR200(weewx.drivers.AbstractDevice):
                             disposition = 'out_of_order'
                         log.info(
                             'genStartup() Discarding archive record %s; '
-                            'current timestamp:%s; previous timestamp:%s' %
+                            'current timestamp:%s; previous archive timestamp:%s' %
                             (disposition,
                              weeutil.weeutil.timestamp_to_string(current_ts),
                              weeutil.weeutil.timestamp_to_string(previous_ts)))
 
-                    elif current_ts > (previous_ts + self._archive_threshold):
+                    elif (timestamp_packet_interval is not None and
+                          current_ts > previous_ts + self._archive_threshold):
                         archive_threshold_drop += 1
                         disposition = 'threshold_exceeded'
                         log.info(
@@ -3363,75 +3658,135 @@ class WMR200(weewx.drivers.AbstractDevice):
                             (cnt, self._archive_threshold,
                              weeutil.weeutil.timestamp_to_string(current_ts)))
 
-                    elif current_ts > since_ts:
-                        packet_record_interval = int(
-                            timestamp_packet_interval / 60.0)
-                        if packet_record_interval == 0:
-                            archive_subminute_drop += 1
-                            disposition = 'subminute_interval'
-                            log.warning(
-                                'genStartup() Discarding sub-minute archive '
-                                'record but CONTINUING recovery; interval=%d '
-                                'timestamp=%s' %
-                                (timestamp_packet_interval,
-                                 weeutil.weeutil.timestamp_to_string(current_ts)))
-                        else:
-                            # Only an accepted archive record advances the
-                            # sequencing reference. A malformed sub-minute
-                            # timestamp therefore cannot poison the rest of
-                            # the startup recovery.
-                            timestamp_packet_previous = current_ts
-                            if timestamp_packet_interval > self._archive_interval:
-                                gap_seconds = max(
-                                    0,
-                                    timestamp_packet_interval -
-                                    self._archive_interval)
-                                archive_gap_count += 1
-                                archive_gap_seconds += gap_seconds
-                                archive_max_gap_seconds = max(
-                                    archive_max_gap_seconds, gap_seconds)
-                                self._developer_trace.event(
-                                    'ARCHIVE', 'archive_recovery_gap',
-                                    previous_ts=previous_ts,
-                                    previous_utc=_utc_iso(previous_ts),
-                                    current_ts=current_ts,
-                                    current_utc=_utc_iso(current_ts),
-                                    interval_seconds=timestamp_packet_interval,
-                                    expected_interval_seconds=self._archive_interval,
-                                    missing_span_seconds=gap_seconds,
-                                    gap_count=archive_gap_count,
-                                    classification='archive_time_gap_detected')
-
-                            pkt.record_update({
-                                'interval': packet_record_interval})
-                            pkt.record_update(
-                                adjust_rain(pkt, PacketArchiveData))
-                            cnt += 1
-                            disposition = 'yielded'
-                            if first_yielded_ts is None:
-                                first_yielded_ts = current_ts
-                            last_yielded_ts = current_ts
-
-                            log.debug(
-                                'genStartup() Yielding archive record cnt:%d '
-                                'after requested timestamp:%d pkt_interval:%d '
-                                'pkt:%s' %
-                                (cnt, since_ts, timestamp_packet_interval,
-                                 weeutil.weeutil.timestamp_to_string(current_ts)))
-                            if DEBUG_PACKETS_COOKED:
-                                pkt.print_cooked()
-                            mapped = self._sensors_to_fields(
-                                pkt.packet_record(), self._sensor_map)
-
                     else:
-                        timestamp_packet_previous = current_ts
-                        archive_before_since += 1
-                        disposition = 'before_since_ts'
-                        log.info(
-                            'genStartup() Discarding received archive record '
-                            'before time requested cnt:%d timestamp:%s' %
-                            (cnt,
-                             weeutil.weeutil.timestamp_to_string(since_ts)))
+                        # Auto-detect the cadence of historical D2 logger data
+                        # separately from the 60-second live WeeWX archive
+                        # interval. The field trace from 10-Aug showed 5-minute
+                        # D2 records while live records remained 1-minute.
+                        if (configured_logger_interval == 0 and
+                                detected_logger_interval is None and
+                                timestamp_packet_interval is not None and
+                                60 <= timestamp_packet_interval <= 3600 and
+                                timestamp_packet_interval % 60 == 0):
+                            if (logger_interval_candidate ==
+                                    timestamp_packet_interval):
+                                logger_interval_candidate_hits += 1
+                            else:
+                                logger_interval_candidate = \
+                                    timestamp_packet_interval
+                                logger_interval_candidate_hits = 1
+                            # Require two matching consecutive intervals so a
+                            # single real gap is not mistaken for logger cadence.
+                            if logger_interval_candidate_hits >= 2:
+                                detected_logger_interval = \
+                                    logger_interval_candidate
+                                self._detected_archive_logger_interval = \
+                                    detected_logger_interval
+                                self._developer_trace.event(
+                                    'ARCHIVE',
+                                    'archive_logger_interval_detected',
+                                    interval_seconds=detected_logger_interval,
+                                    interval_minutes=int(
+                                        detected_logger_interval / 60),
+                                    samples=logger_interval_candidate_hits,
+                                    action='use_for_archive_gap_accounting')
+                                log.info(
+                                    'Detected WMR200 D2 logger interval: %d sec' %
+                                    detected_logger_interval)
+
+                        if current_ts <= effective_since_ts:
+                            # Old-but-valid archive data still advances the
+                            # archive sequencing reference. This is how gp10
+                            # walks safely through a backlog until it reaches
+                            # the requested recovery watermark.
+                            timestamp_archive_previous = current_ts
+                            archive_before_since += 1
+                            disposition = 'before_since_ts'
+                            log.info(
+                                'genStartup() Discarding received archive '
+                                'record before recovery watermark cnt:%d '
+                                'timestamp:%s watermark:%s' %
+                                (cnt,
+                                 weeutil.weeutil.timestamp_to_string(current_ts),
+                                 weeutil.weeutil.timestamp_to_string(
+                                     effective_since_ts)))
+                        else:
+                            expected_interval = (
+                                detected_logger_interval or
+                                max(60, int(self._archive_interval)))
+                            interval_seconds = (
+                                timestamp_packet_interval
+                                if timestamp_packet_interval is not None
+                                else expected_interval)
+                            packet_record_interval = max(
+                                1, int(interval_seconds / 60.0))
+
+                            if (timestamp_packet_interval is not None and
+                                    timestamp_packet_interval < 60):
+                                archive_subminute_drop += 1
+                                disposition = 'subminute_interval'
+                                log.warning(
+                                    'genStartup() Discarding sub-minute '
+                                    'archive record but CONTINUING recovery; '
+                                    'interval=%d timestamp=%s' %
+                                    (timestamp_packet_interval,
+                                     weeutil.weeutil.timestamp_to_string(
+                                         current_ts)))
+                                # Do not advance timestamp_archive_previous:
+                                # one short malformed timestamp must not poison
+                                # the next otherwise valid archive record.
+                            else:
+                                timestamp_archive_previous = current_ts
+                                if (timestamp_packet_interval is not None and
+                                        timestamp_packet_interval >
+                                        expected_interval and
+                                        not (configured_logger_interval == 0 and
+                                             detected_logger_interval is None)):
+                                    gap_seconds = max(
+                                        0,
+                                        timestamp_packet_interval -
+                                        expected_interval)
+                                    archive_gap_count += 1
+                                    archive_gap_seconds += gap_seconds
+                                    archive_max_gap_seconds = max(
+                                        archive_max_gap_seconds, gap_seconds)
+                                    self._developer_trace.event(
+                                        'ARCHIVE', 'archive_recovery_gap',
+                                        previous_ts=previous_ts,
+                                        previous_utc=_utc_iso(previous_ts),
+                                        current_ts=current_ts,
+                                        current_utc=_utc_iso(current_ts),
+                                        interval_seconds=
+                                            timestamp_packet_interval,
+                                        expected_interval_seconds=
+                                            expected_interval,
+                                        missing_span_seconds=gap_seconds,
+                                        gap_count=archive_gap_count,
+                                        classification=
+                                            'archive_time_gap_detected')
+
+                                pkt.record_update({
+                                    'interval': packet_record_interval})
+                                pkt.record_update(
+                                    adjust_rain(pkt, PacketArchiveData))
+                                cnt += 1
+                                disposition = 'yielded'
+                                if first_yielded_ts is None:
+                                    first_yielded_ts = current_ts
+                                last_yielded_ts = current_ts
+
+                                log.debug(
+                                    'genStartup() Yielding archive record '
+                                    'cnt:%d after recovery watermark:%d '
+                                    'pkt_interval:%d pkt:%s' %
+                                    (cnt, effective_since_ts,
+                                     interval_seconds,
+                                     weeutil.weeutil.timestamp_to_string(
+                                         current_ts)))
+                                if DEBUG_PACKETS_COOKED:
+                                    pkt.print_cooked()
+                                mapped = self._sensors_to_fields(
+                                    pkt.packet_record(), self._sensor_map)
 
                     self._developer_trace.event(
                         'ARCHIVE', 'archive_record_evaluated',
@@ -3439,9 +3794,12 @@ class WMR200(weewx.drivers.AbstractDevice):
                         record_number=archive_received,
                         record_ts=current_ts,
                         record_utc=_utc_iso(current_ts),
+                        requested_since_ts=requested_since_ts,
+                        effective_since_ts=effective_since_ts,
                         previous_ts=previous_ts,
                         previous_utc=_utc_iso(previous_ts),
                         interval_seconds=timestamp_packet_interval,
+                        logger_interval_seconds=detected_logger_interval,
                         disposition=disposition,
                         gap_seconds=gap_seconds,
                         yielded_total=cnt,
@@ -3454,13 +3812,23 @@ class WMR200(weewx.drivers.AbstractDevice):
                     if disposition == 'yielded':
                         yield mapped
 
-                if (int(time.time() + 0.5) - timestamp_last_archive_rx >
-                        self._archive_startup):
+                now_monotonic = time.monotonic()
+                _maybe_clock_fallback(now_monotonic)
+                quiet_elapsed = max(
+                    0.0,
+                    now_monotonic - timestamp_last_archive_rx_monotonic)
+                clock_waiting = (
+                    self.use_pc_time and self.time_drift is None)
+
+                if (not clock_waiting and
+                        not PacketArchive.pkt_queue and
+                        quiet_elapsed > self._archive_startup):
                     recovery_outcome = 'archive_drained'
                     log.info(
                         'genStartup() phase exiting since looks like all '
                         'archive packets have been retrieved after %d sec '
-                        'cnt:%d' % (self._archive_startup, cnt))
+                        'of monotonic quiet time cnt:%d' %
+                        (self._archive_startup, cnt))
                     if timestamp_packet_first is not None:
                         data_span = (timestamp_packet_current -
                                      timestamp_packet_first)
@@ -3477,6 +3845,7 @@ class WMR200(weewx.drivers.AbstractDevice):
                                 'genStartup() Average yielded packets per '
                                 'data-minute:%f' %
                                 (cnt / (data_span / 60.0)))
+                    self._archive_recovery_state_clear()
                     return
         except Exception as exception:
             recovery_outcome = 'error'
@@ -3484,8 +3853,11 @@ class WMR200(weewx.drivers.AbstractDevice):
                 'ARCHIVE', 'archive_recovery_error',
                 error_type=type(exception).__name__,
                 reason=str(exception),
+                requested_since_ts=requested_since_ts,
+                effective_since_ts=effective_since_ts,
                 records_received=archive_received,
-                records_yielded=cnt)
+                records_yielded=cnt,
+                state_preserved=self._archive_recovery_resume)
             raise
         finally:
             elapsed_wall_s = max(
@@ -3498,8 +3870,11 @@ class WMR200(weewx.drivers.AbstractDevice):
             self._developer_trace.event(
                 'ARCHIVE', 'archive_recovery_complete',
                 outcome=recovery_outcome,
-                since_ts=since_ts,
-                since_utc=_utc_iso(since_ts),
+                requested_since_ts=requested_since_ts,
+                requested_since_utc=_utc_iso(requested_since_ts),
+                since_ts=effective_since_ts,
+                since_utc=_utc_iso(effective_since_ts),
+                resume_used=resume_used,
                 elapsed_wall_s=round(elapsed_wall_s, 3),
                 records_received=archive_received,
                 records_yielded=cnt,
@@ -3511,6 +3886,11 @@ class WMR200(weewx.drivers.AbstractDevice):
                 gaps_detected=archive_gap_count,
                 gap_seconds_total=archive_gap_seconds,
                 max_gap_seconds=archive_max_gap_seconds,
+                detected_logger_interval_seconds=
+                    detected_logger_interval,
+                time_drift=self.time_drift,
+                clock_fallback=getattr(self, '_archive_clock_fallback', False),
+                rejected_clock_samples=getattr(self, '_time_drift_rejected_count', 0),
                 first_received_ts=timestamp_packet_first,
                 first_received_utc=_utc_iso(timestamp_packet_first),
                 last_received_ts=timestamp_packet_current,
@@ -3520,7 +3900,10 @@ class WMR200(weewx.drivers.AbstractDevice):
                 last_yielded_ts=last_yielded_ts,
                 last_yielded_utc=_utc_iso(last_yielded_ts),
                 data_span_seconds=data_span_s,
-                pending_archive_queue=len(PacketArchive.pkt_queue))
+                pending_archive_queue=len(PacketArchive.pkt_queue),
+                recovery_state_preserved=(
+                    recovery_outcome != 'archive_drained' and
+                    getattr(self, '_archive_recovery_resume', False)))
             self._archive_recovery_active = False
             self._set_protocol_mode(
                 'live_pending', reason='genStartupRecords_exit')
@@ -3630,7 +4013,14 @@ class WMR200ConfEditor(weewx.drivers.AbstractConfEditor):
     ignore_checksum = False
     sensor_status = True
 
-    # USB recovery inherited from gp7-streamresync. gp9 uses short
+    # gp10 archive / Raspberry boot-clock hardening.
+    archive_clock_drift_max = 900
+    archive_clock_wait = 180
+    archive_recovery_resume = True
+    archive_recovery_state_path = /var/lib/weewx/wmr200-archive-recovery.json
+    archive_logger_interval = 0
+
+    # USB recovery inherited from gp7-streamresync. gp9/gp10 use short
     # interrupt-read slices so the shared PyUSB lock cannot delay D0 for the
     # old 15-second blocking-read window. Logical timeout health remains 15 s.
     usb_write_retries = 3

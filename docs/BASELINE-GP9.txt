@@ -1,0 +1,10 @@
+Baseline driver: 3.5.4-gp9-live-scheduler
+New driver: 3.5.4-gp10-archive-clock-recovery
+
+Field issue reproduced from 10-Aug-2026 logs:
+- Raspberry Pi booted before NTP synchronization.
+- Initial host/console drift was about -48993 seconds.
+- NTP later stepped system wall clock forward.
+- gp9 startup catch-up ended early and later historical D2 records were discarded/misclassified.
+
+Scope: preserve gp9 USB scheduler/decoder/checksum/EPIPE/reopen/stream-resync behavior; harden only archive timing, clock validation, sequencing and interrupted catch-up resume.

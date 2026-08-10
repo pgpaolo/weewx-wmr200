@@ -1,0 +1,74 @@
+WMR200 3.5.4-gp10-archive-clock-recovery - automated regression tests
+Generated: 2026-08-10
+
+PASS: Python compile checks
+PASS: shell syntax checks
+RUN: tests/test_archive_recovery.py
+WMR200 developer trace ENABLED: /tmp/tmp5gv_2u7x/trace.jsonl
+genStartup() Discarding sub-minute archive record but CONTINUING recovery; interval=30 timestamp=1210
+WMR200 developer trace ENABLED: /tmp/tmpe2jzms5y/trace.jsonl
+WMR200 developer trace ENABLED: /tmp/tmprvz2fltj/trace.jsonl
+Host clock not yet plausible for archive adjustment: candidate drift=-48993 sec limit=900 sec; waiting for clock sync
+WMR200 developer trace ENABLED: /tmp/tmppp91x5um/trace.jsonl
+Host clock did not become plausible within 0 sec; archive recovery will preserve native WMR200 timestamps with zero drift for this recovery
+WMR200 developer trace ENABLED: /tmp/tmph_ocr7qf/trace.jsonl
+genStartup() Resuming interrupted archive recovery from 1000 instead of current DB tail 2000
+PASS: test_archive_recovery_classification_and_summary
+PASS: test_since_watermark_is_not_archive_sequence_reference
+PASS: test_large_boot_drift_is_rejected_then_ntp_drift_is_accepted
+PASS: test_clock_wait_falls_back_to_native_console_time
+PASS: test_interrupted_recovery_resume_uses_original_watermark
+PASS: test_startup_recovery_does_not_use_wall_clock_for_timeout
+All gp10 archive recovery tests passed
+RUN: tests/test_configure_trace.py
+Developer trace enabled in /tmp/tmp181qdhg7/weewx.conf
+Trace path: /var/log/weewx/wmr200-developer-trace.jsonl
+Driver file log: enabled
+Driver log path: /var/log/weewx/wmr200-debug.log
+Developer trace disabled in /tmp/tmp181qdhg7/weewx.conf
+Trace path: /var/log/weewx/wmr200-developer-trace.jsonl
+Driver file log: disabled
+Driver log path: /var/log/weewx/wmr200-debug.log
+PASS: configure-developer-trace
+RUN: tests/test_developer_trace.py
+WMR200 developer trace ENABLED: /tmp/tmpv3ufvc7k/trace.jsonl
+WMR200 developer trace ENABLED: /tmp/tmp42oj6jxb/trace.jsonl
+WMR200 developer trace path /tmp/tmpr_rqmee0/not-a-directory/trace.jsonl is not writable; using fallback /tmp/wmr200-developer-trace.jsonl
+WMR200 developer trace ENABLED: /tmp/wmr200-developer-trace.jsonl
+WMR200 developer trace ENABLED: /tmp/tmpc17r68qw/trace.jsonl
+WMR200 developer trace ENABLED: /tmp/tmpxlt6k2a2/trace.jsonl
+PASS: test_trace_writes_jsonl
+PASS: test_trace_timeout_filter
+PASS: test_trace_path_failure_is_nonfatal
+PASS: test_usb_trace_integration
+PASS: test_default_limits_and_rotation_count
+All developer trace tests passed
+RUN: tests/test_driver_file_log.py
+WMR200 driver file log path /tmp/tmp6roztlo6/not-a-directory/wmr200-debug.log is not writable; using /tmp/wmr200-debug.log
+PASS: test_driver_file_log_writes_and_rotates
+PASS: test_driver_file_log_does_not_change_logger_after_stop
+PASS: test_driver_file_log_path_failure_is_nonfatal
+All driver file log tests passed
+RUN: tests/test_usb_recovery.py
+read_device() Dropping malformed USB report and requesting protocol resync: valid=8 available=7 gap=1 report=[8, 1, 2, 3, 4, 5, 6, 7]
+write_device() transient USB error errno=32 attempt=1/3: Broken pipe
+write_device() transient USB error errno=32 attempt=2/3: Broken pipe
+write_device() transient USB error errno=32 attempt=1/2: Broken pipe
+write_device() transient USB error errno=32 attempt=2/2: Broken pipe
+write_device() Command succeeded after USB reopen
+Console archive erase command sent once at startup
+Discarding packet with invalid checksum: bad checksum d3 04 00 00
+Received archive-ready D1 outside startup recovery; reasserting LIVE mode instead of requesting archive data
+PASS: test_error_classification
+PASS: test_read_timeout_and_reports
+PASS: test_gp10_preserves_short_read_slice_configuration
+PASS: test_write_retry_and_counter
+PASS: test_write_reopen
+PASS: test_archive_erase_is_one_shot
+PASS: test_ignore_checksum_drops_packet
+PASS: test_archive_commands_are_mode_aware
+PASS: test_configuration_corrections
+All WMR200 recovery tests passed
+
+RESULT: ALL AUTOMATED TESTS PASSED
+Hardware archive/NTP validation: required on a real WMR200/Raspberry Pi before final stable designation.

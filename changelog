@@ -1,17 +1,12 @@
-3.5.4-gp9-live-scheduler
-- Baseline: 3.5.4-gp8-archive-trace.
-- Preserved gp8 decoder, checksum, EPIPE/reopen and stream-resync behavior.
-- Replaced 15 s blocking interrupt reads with 2 s scheduling slices.
-- Preserved logical timeout accounting at 15 s of continuous silence.
-- Added heartbeat request/dispatch latency and USB lock-wait trace fields.
-- Added explicit LIVE/ARCHIVE protocol mode state.
-- D1 requests archive data only during startup archive recovery.
-- D2 received in LIVE no longer requests additional archive records.
-- D2 received in LIVE is traced and not retained in PacketArchive.pkt_queue.
-- Static packet queues are cleared on driver instance startup.
-- Diagnostic logs remain limited to 10 MB + 4 backups each.
+3.5.4-gp10-archive-clock-recovery
+- Baseline: 3.5.4-gp9-live-scheduler.
+- Use monotonic time for startup archive quiet timeout.
+- Reject implausible pre-NTP host/console drift; wait for clock sync.
+- Fallback to native WMR200 timestamps if clock never becomes plausible.
+- Separate archive ordering from WeeWX since_ts watermark.
+- Resume interrupted catch-up from a persistent watermark.
+- Auto-detect historical D2 logger cadence without changing live archive_interval.
+- Preserve gp9 USB scheduler, checksum, EPIPE/reopen and stream-resync behavior.
 
-3.5.4-gp8-archive-trace
-- Added structured startup archive recovery diagnostics and gap accounting.
-- Added asynchronous rotating driver_file_log.
-- Sub-minute archive anomalies are dropped without aborting recovery.
+3.5.4-gp9-live-scheduler
+- Short USB read slices and state-aware LIVE/ARCHIVE handling.

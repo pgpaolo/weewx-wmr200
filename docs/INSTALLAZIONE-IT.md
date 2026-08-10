@@ -1,27 +1,26 @@
-# Installazione - WMR200 3.5.4-gp9-live-scheduler
+# Installazione WMR200 gp10
 
-## Installazione automatica WeeWX 5
+## Installazione consigliata WeeWX 5
 
 ```bash
-unzip weewx-wmr200a-hardened-3.5.4-gp9-live-scheduler.zip
-cd weewx-wmr200a-hardened-3.5.4-gp9-live-scheduler
+unzip weewx-wmr200a-hardened-3.5.4-gp10-archive-clock-recovery.zip
+cd weewx-wmr200a-hardened-3.5.4-gp10-archive-clock-recovery
 sudo ./install.sh
 ```
 
-L'installer:
+Lo script:
 
-1. individua `weewx.conf` oppure accetta `--config PATH`;
-2. crea un backup in `/var/backups/weewx-wmr200/<timestamp>/`;
-3. installa la regola udev `99-wmr200.rules`;
-4. disabilita l'autosuspend USB per `0fde:ca01`;
-5. prepara `/var/log/weewx` e i due file diagnostici;
-6. crea `/etc/tmpfiles.d/weewx-wmr200.conf` se disponibile;
-7. installa l'estensione tramite `weectl extension install`;
-8. configura `driver = user.wmr200`;
-9. applica i parametri diagnostici e scheduler gp9;
-10. riavvia WeeWX salvo `--no-restart`.
+1. individua `weewx.conf`;
+2. crea un backup della configurazione e del driver precedente;
+3. installa la regola udev;
+4. prepara i log diagnostici;
+5. verifica/crea la directory persistente `/var/lib/weewx` per lo stato del catch-up;
+6. installa l'estensione con `weectl`;
+7. configura `user.wmr200`;
+8. applica i parametri gp10;
+9. riavvia WeeWX salvo `--no-restart`.
 
-## Configurazione consigliata
+## Configurazione gp10 raccomandata
 
 ```ini
 [WMR200]
@@ -33,30 +32,21 @@ L'installer:
     archive_interval = 60
     archive_startup = 120
     archive_threshold = 1512000
-    ignore_checksum = False
-    sensor_status = True
 
-    # USB recovery / gp9 scheduler
-    usb_write_retries = 3
-    usb_read_retries = 2
-    usb_retry_delay = 0.5
-    usb_reopen_on_failure = True
+    archive_clock_drift_max = 900
+    archive_clock_wait = 180
+    archive_recovery_resume = True
+    archive_recovery_state_path = /var/lib/weewx/wmr200-archive-recovery.json
+    archive_logger_interval = 0
+
     usb_read_slice_timeout = 2.0
     usb_logical_timeout_seconds = 15
-    usb_timeout_warn_consecutive = 2
-    usb_timeout_error_consecutive = 4
-    usb_health_interval = 300
 
-    # Trace strutturato
     developer_trace = True
     developer_trace_path = /var/log/weewx/wmr200-developer-trace.jsonl
     developer_trace_max_mb = 10
     developer_trace_backups = 4
-    developer_trace_queue_size = 4096
-    developer_trace_include_timeouts = True
-    developer_trace_include_packets = True
 
-    # Log testuale asincrono
     driver_file_log = True
     driver_file_log_path = /var/log/weewx/wmr200-debug.log
     driver_file_log_level = DEBUG
@@ -64,28 +54,19 @@ L'installer:
     driver_file_log_backups = 4
 ```
 
-Il timeout `usb_read_slice_timeout = 2.0` serve solo a rilasciare frequentemente
-il lock PyUSB. Il driver considera un vero timeout di comunicazione solo quando
-il silenzio continuo supera `usb_logical_timeout_seconds = 15`.
+### Significato delle nuove opzioni
 
-Ogni famiglia di log conserva il file attivo + 4 backup: massimo 5 file e circa
-50 MB per famiglia con i valori sopra.
+- `archive_clock_drift_max = 900`: un drift iniziale superiore a 15 minuti non viene applicato ai record storici.
+- `archive_clock_wait = 180`: attesa massima del clock host plausibile prima di usare l'ora nativa della console.
+- `archive_recovery_resume = True`: conserva il watermark originale se WeeWX/driver si interrompe durante il catch-up.
+- `archive_recovery_state_path`: file piccolo e persistente; non metterlo in `/var/log` se `/var/log` è tmpfs.
+- `archive_logger_interval = 0`: rilevamento automatico della cadenza dei D2 storici. Non modifica `archive_interval = 60` usato da WeeWX in live.
 
 ## Verifica
 
 ```bash
 sudo ./check-install.sh
-sudo systemctl status weewx --no-pager
-sudo tail -f /var/log/weewx/wmr200-debug.log
+journalctl -u weewx -n 200 --no-pager | grep -E 'wmr200|archive|clock'
 ```
 
-Per verificare la latenza D0:
-
-```bash
-sudo ./tools/trace-summary.py /var/log/weewx/wmr200-developer-trace.jsonl\*
-```
-
-## Backup / rollback
-
-Il backup pre-installazione viene indicato a video. `uninstall.sh` rimuove
-l'estensione e la regola di supporto; i log raccolti non vengono cancellati.
+Il driver deve mostrare `3.5.4-gp10-archive-clock-recovery`.

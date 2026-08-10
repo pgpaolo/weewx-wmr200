@@ -12,7 +12,7 @@ class WMR200Installer(ExtensionInstaller):
 
     def __init__(self):
         super(WMR200Installer, self).__init__(
-            version="3.5.4-gp9-live-scheduler",
+            version="3.5.4-gp10-archive-clock-recovery",
             name='wmr200',
             description='WeeWX driver for the Oregon Scientific WMR200 station',
             author="Chris Manton; John E.P. Hynes; GP recovery hardening",
@@ -24,6 +24,11 @@ class WMR200Installer(ExtensionInstaller):
                     'archive_interval': '60',
                     'ignore_checksum': 'False',
                     'archive_startup': '120',
+                    'archive_clock_drift_max': '900',
+                    'archive_clock_wait': '180',
+                    'archive_recovery_resume': 'True',
+                    'archive_recovery_state_path': '/var/lib/weewx/wmr200-archive-recovery.json',
+                    'archive_logger_interval': '0',
                     'archive_threshold': '1512000',
                     'sensor_status': 'True',
                     'usb_write_retries': '3',
