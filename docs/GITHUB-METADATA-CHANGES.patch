@@ -1,0 +1,350 @@
+diff -ruN a/README.md b/README.md
+--- a/README.md	2026-08-11 11:06:19.994569584 +0000
++++ b/README.md	2026-08-11 11:06:19.996200060 +0000
+@@ -1,25 +1,40 @@
+ # WeeWX WMR200 Hardened Driver
+ 
+-Advanced USB driver for **Oregon Scientific WMR200 / WMR200A** consoles, designed for WeeWX 4/5 and Raspberry Pi deployments.
++[![CI](https://github.com/pgpaolo/weewx-wmr200/actions/workflows/validate.yml/badge.svg)](https://github.com/pgpaolo/weewx-wmr200/actions/workflows/validate.yml)
++![Status](https://img.shields.io/badge/status-release%20candidate-orange)
++![Driver](https://img.shields.io/badge/driver-3.5.4--gp10-blue)
++![WeeWX](https://img.shields.io/badge/WeeWX-4%20%7C%205-4c8bf5)
++![Hardware](https://img.shields.io/badge/hardware-WMR200%20%7C%20WMR200A-lightgrey)
++
++Advanced USB driver for **Oregon Scientific WMR200 / WMR200A** consoles, with hardened USB handling, structured diagnostics, developer tracing and archive catch-up support for Raspberry Pi / Linux WeeWX deployments.
+ 
+ > **Driver version:** `3.5.4-gp10-archive-clock-recovery`  
+ > **Baseline:** `3.5.4-gp9-live-scheduler`  
+-> **Status:** community project; not officially supported by the WeeWX project.
++> **Status:** release candidate / field validation  
++> **Support:** community project; not officially supported by the WeeWX project
++
++## Project lineage
++
++This repository is derived from the WMR200 driver maintained in the WeeWX community and preserves the original source attribution. The upstream historical repository is:
++
++- [weewx/weewx-wmr200](https://github.com/weewx/weewx-wmr200)
++
++The gp-series work focuses on USB resilience, diagnostics, stream recovery and safe archive catch-up while preserving the established WMR200 packet decoder and sensor mappings.
+ 
+ ## Why gp10
+ 
+-gp10 is a field-driven archive-recovery release. A real Raspberry Pi boot showed that WeeWX can start before networking/NTP has corrected the system clock. gp9 cached the first host/console drift and used wall-clock time inside startup recovery. A later NTP step could therefore terminate catch-up early and historical D2 records could be discarded or misclassified.
++`gp10` is a field-driven archive-recovery release. A real Raspberry Pi boot showed that WeeWX can start before networking/NTP has corrected the system clock. In that situation, a wall-clock step could terminate archive catch-up early and historical D2 records could later be rejected against the current database tail.
+ 
+-gp10 keeps the validated gp9 live USB scheduler and adds a clock-safe archive state machine:
++`gp10` keeps the validated gp9 live USB scheduler and adds a clock-safe archive state machine:
+ 
+-- startup recovery quiet timers use **`time.monotonic()` only**;
+-- implausible first host/console drift samples are rejected;
++- startup recovery quiet timers use `time.monotonic()`;
++- implausible initial host/console drift samples are rejected;
+ - the driver keeps sampling until the host clock becomes plausible;
+-- after a configurable wait, recovery falls back to **native WMR200 timestamps** instead of applying a bogus multi-hour drift;
+-- archive ordering is based on consecutive D2 records, never on the WeeWX database watermark;
++- after a configurable wait, recovery can fall back to native WMR200 timestamps instead of applying a bogus multi-hour drift;
++- archive ordering is based on consecutive D2 records, not on the WeeWX database watermark;
+ - `since_ts` is used only as the catch-up boundary;
+-- interrupted catch-up can resume from its original watermark using a small persistent state file;
+-- historical D2 logger cadence can be auto-detected independently of the 60-second live WeeWX archive interval.
++- interrupted catch-up can resume from its original watermark using a persistent state file;
++- historical D2 cadence can be auto-detected independently of the normal live WeeWX archive interval.
+ 
+ ## Preserved from gp9
+ 
+@@ -29,10 +44,41 @@
+ - checksum handling;
+ - EPIPE / timeout recovery and controlled reopen;
+ - malformed-HID stream resynchronization;
+-- sensor mappings and packet decoder;
++- existing sensor mappings and packet decoder;
+ - asynchronous rotating JSONL developer trace;
+ - asynchronous rotating textual driver log.
+ 
++## Installation — WeeWX 5
++
++The repository is a standard WeeWX extension because it contains `install.py`. The official WeeWX 5 extension command is `weectl extension install EXTENSION-LOCATION`.
++
++### From a local clone
++
++```bash
++git clone https://github.com/pgpaolo/weewx-wmr200.git
++cd weewx-wmr200
++
++sudo weectl extension install .
++sudo weectl station reconfigure --driver=user.wmr200
++```
++
++Install the supplied udev rule once on Linux systems where the WeeWX service needs direct USB access:
++
++```bash
++sudo install -m 0644 util/udev/rules.d/wmr200.rules /etc/udev/rules.d/wmr200.rules
++sudo udevadm control --reload-rules
++```
++
++Then unplug/replug the WMR200 USB connection, or reboot the host, and restart WeeWX:
++
++```bash
++sudo systemctl restart weewx
++```
++
++> On installations where WeeWX is owned by the current user rather than root, `sudo` may not be required for the `weectl` commands.
++
++See the full Italian installation guide: [docs/INSTALLAZIONE-IT.md](docs/INSTALLAZIONE-IT.md).
++
+ ## Recommended configuration
+ 
+ ```ini
+@@ -55,7 +101,7 @@
+     archive_recovery_state_path = /var/lib/weewx/wmr200-archive-recovery.json
+     archive_logger_interval = 0
+ 
+-    # USB recovery / gp9 scheduler retained by gp10
++    # gp9 USB scheduler retained by gp10
+     usb_write_retries = 3
+     usb_read_retries = 2
+     usb_retry_delay = 0.5
+@@ -85,7 +131,7 @@
+     [[sensor_map]]
+ ```
+ 
+-`archive_logger_interval = 0` means auto-detect the interval of historical D2 records. It does **not** change the driver's `archive_interval = 60` exposed to WeeWX for normal live archiving.
++`archive_logger_interval = 0` enables auto-detection of the cadence of historical D2 records. It does **not** change `archive_interval = 60` exposed to WeeWX for normal live archiving.
+ 
+ ## Important gp10 trace events
+ 
+@@ -98,29 +144,41 @@
+ - `archive_recovery_start`
+ - `archive_record_evaluated`
+ - `archive_recovery_complete`
+-- all gp9 USB scheduler events (`usb_poll_timeout`, `usb_read_timeout`, `heartbeat_sent`, etc.)
++- gp9 USB scheduler events such as `usb_poll_timeout`, `usb_read_timeout` and `heartbeat_sent`
+ 
+-## Installation
++## Diagnostics
+ 
+-```bash
+-sudo ./install.sh
+-```
++When reporting a problem, include the driver version, WeeWX version, host OS / Raspberry Pi model, WMR200/WMR200A model, the relevant `[WMR200]` configuration with secrets removed, and preferably a diagnostic bundle or the developer trace around the incident.
+ 
+-or as a WeeWX extension:
++See:
+ 
+-```bash
+-sudo weectl extension install .
+-sudo weectl station reconfigure --driver=user.wmr200
+-```
++- [Developer trace](docs/DEVELOPER-TRACE.md)
++- [Developer trace — Italian](docs/DEVELOPER-TRACE-IT.md)
++- [Testing — Italian](docs/TESTING-IT.md)
++- [Archive recovery / NTP — Italian](docs/ARCHIVE-RECOVERY-NTP-IT.md)
+ 
+-See `INSTALLAZIONE-IT.md` and `UPGRADE-GP9-TO-GP10-IT.md` for the complete procedure.
++## Upgrade and release notes
++
++- [gp9 → gp10 upgrade guide](docs/UPGRADE-GP9-TO-GP10-IT.md)
++- [gp10 release notes](docs/RELEASE-NOTES-GP10.md)
++- [Changelog](CHANGELOG.md)
+ 
+ ## Safety
+ 
+-Keep:
++During validation keep:
+ 
+ ```ini
+ erase_archive = False
+ ```
+ 
+-during validation. gp10 does not intentionally erase the console logger during normal catch-up.
++The driver does not intentionally erase the console logger during normal catch-up when this option is disabled.
++
++## Contributing
++
++Bug reports and hardware test results are welcome. Please use the GitHub issue templates so that USB, archive and clock information is collected consistently.
++
++See [CONTRIBUTING.md](CONTRIBUTING.md).
++
++## Security
++
++For security-related reports, see [SECURITY.md](SECURITY.md). Do not publish credentials, private hostnames, API keys or complete configuration files containing secrets in public issues.
+diff -ruN a/docs/INSTALLAZIONE-IT.md b/docs/INSTALLAZIONE-IT.md
+--- a/docs/INSTALLAZIONE-IT.md	2026-08-11 11:06:19.995476112 +0000
++++ b/docs/INSTALLAZIONE-IT.md	2026-08-11 11:06:19.997004992 +0000
+@@ -1,24 +1,66 @@
+ # Installazione WMR200 gp10
+ 
+-## Installazione consigliata WeeWX 5
++Questa guida descrive l'installazione dal repository GitHub. Il repository contiene `install.py`, quindi viene installato come estensione WeeWX.
++
++## Requisiti
++
++- WeeWX installato e funzionante;
++- accesso amministrativo al sistema Linux per la regola udev e, nelle installazioni Debian/RPM, per i comandi `weectl`;
++- WMR200/WMR200A collegata via USB;
++- Python e dipendenze già richieste dalla propria installazione WeeWX.
++
++## Installazione consigliata — WeeWX 5
++
++Clonare il repository:
++
++```bash
++git clone https://github.com/pgpaolo/weewx-wmr200.git
++cd weewx-wmr200
++```
++
++Installare l'estensione:
++
++```bash
++sudo weectl extension install .
++```
++
++Configurare WeeWX per utilizzare il driver:
+ 
+ ```bash
+-unzip weewx-wmr200a-hardened-3.5.4-gp10-archive-clock-recovery.zip
+-cd weewx-wmr200a-hardened-3.5.4-gp10-archive-clock-recovery
+-sudo ./install.sh
++sudo weectl station reconfigure --driver=user.wmr200
+ ```
+ 
+-Lo script:
++> Nelle installazioni WeeWX possedute direttamente dall'utente corrente, `sudo` potrebbe non essere necessario per `weectl`.
+ 
+-1. individua `weewx.conf`;
+-2. crea un backup della configurazione e del driver precedente;
+-3. installa la regola udev;
+-4. prepara i log diagnostici;
+-5. verifica/crea la directory persistente `/var/lib/weewx` per lo stato del catch-up;
+-6. installa l'estensione con `weectl`;
+-7. configura `user.wmr200`;
+-8. applica i parametri gp10;
+-9. riavvia WeeWX salvo `--no-restart`.
++## Regola udev USB
++
++Il file `install.py` installa il driver WeeWX, ma non copia automaticamente la regola udev di sistema. Installarla una volta con:
++
++```bash
++sudo install -m 0644 util/udev/rules.d/wmr200.rules /etc/udev/rules.d/wmr200.rules
++sudo udevadm control --reload-rules
++```
++
++Dopo il reload, scollegare e ricollegare il cavo USB della WMR200 oppure riavviare il Raspberry Pi.
++
++La regola assegna il dispositivo USB Oregon Scientific `0fde:ca01` al gruppo `weewx`, con permessi `0660`, e disabilita l'autosuspend USB per il dispositivo.
++
++## Directory persistente per il recupero archivio
++
++Con:
++
++```ini
++archive_recovery_resume = True
++archive_recovery_state_path = /var/lib/weewx/wmr200-archive-recovery.json
++```
++
++assicurarsi che `/var/lib/weewx` sia persistente e scrivibile dal servizio WeeWX:
++
++```bash
++sudo install -d -o weewx -g weewx -m 0755 /var/lib/weewx
++```
++
++Non collocare lo state file sotto `/var/log` se `/var/log` è montato in `tmpfs`.
+ 
+ ## Configurazione gp10 raccomandata
+ 
+@@ -32,6 +74,8 @@
+     archive_interval = 60
+     archive_startup = 120
+     archive_threshold = 1512000
++    ignore_checksum = False
++    sensor_status = True
+ 
+     archive_clock_drift_max = 900
+     archive_clock_wait = 180
+@@ -39,34 +83,77 @@
+     archive_recovery_state_path = /var/lib/weewx/wmr200-archive-recovery.json
+     archive_logger_interval = 0
+ 
++    usb_write_retries = 3
++    usb_read_retries = 2
++    usb_retry_delay = 0.5
++    usb_reopen_on_failure = True
+     usb_read_slice_timeout = 2.0
+     usb_logical_timeout_seconds = 15
++    usb_timeout_warn_consecutive = 2
++    usb_timeout_error_consecutive = 4
++    usb_health_interval = 300
+ 
+     developer_trace = True
+     developer_trace_path = /var/log/weewx/wmr200-developer-trace.jsonl
+     developer_trace_max_mb = 10
+     developer_trace_backups = 4
++    developer_trace_queue_size = 4096
++    developer_trace_include_timeouts = True
++    developer_trace_include_packets = True
+ 
+     driver_file_log = True
+     driver_file_log_path = /var/log/weewx/wmr200-debug.log
+     driver_file_log_level = DEBUG
+     driver_file_log_max_mb = 10
+     driver_file_log_backups = 4
++
++    [[sensor_map]]
+ ```
+ 
+-### Significato delle nuove opzioni
++### Significato delle opzioni gp10
+ 
+-- `archive_clock_drift_max = 900`: un drift iniziale superiore a 15 minuti non viene applicato ai record storici.
+-- `archive_clock_wait = 180`: attesa massima del clock host plausibile prima di usare l'ora nativa della console.
++- `archive_clock_drift_max = 900`: un drift iniziale superiore a 15 minuti non viene applicato automaticamente ai record storici.
++- `archive_clock_wait = 180`: attesa massima del clock host plausibile prima del fallback all'ora nativa della console.
+ - `archive_recovery_resume = True`: conserva il watermark originale se WeeWX/driver si interrompe durante il catch-up.
+-- `archive_recovery_state_path`: file piccolo e persistente; non metterlo in `/var/log` se `/var/log` è tmpfs.
+-- `archive_logger_interval = 0`: rilevamento automatico della cadenza dei D2 storici. Non modifica `archive_interval = 60` usato da WeeWX in live.
++- `archive_recovery_state_path`: state file persistente del recupero.
++- `archive_logger_interval = 0`: rilevamento automatico della cadenza D2 storica; non modifica `archive_interval = 60` usato da WeeWX in live.
++
++## Riavvio e verifica
++
++Riavviare WeeWX:
++
++```bash
++sudo systemctl restart weewx
++```
+ 
+-## Verifica
++Verificare versione e messaggi principali:
+ 
+ ```bash
+-sudo ./check-install.sh
+-journalctl -u weewx -n 200 --no-pager | grep -E 'wmr200|archive|clock'
++journalctl -u weewx -n 250 --no-pager | grep -Ei 'wmr200|archive|clock|usb'
+ ```
+ 
+-Il driver deve mostrare `3.5.4-gp10-archive-clock-recovery`.
++Il log deve riportare:
++
++```text
++driver version is 3.5.4-gp10-archive-clock-recovery
++```
++
++Per verificare la sincronizzazione NTP del Raspberry Pi:
++
++```bash
++timedatectl
++```
++
++Durante un test di recupero archivio sono particolarmente utili gli eventi:
++
++```text
++host_clock_not_ready
++host_clock_ready
++archive_recovery_start
++archive_record_evaluated
++archive_recovery_complete
++```
++
++## Aggiornamento da gp9
++
++Vedere [UPGRADE-GP9-TO-GP10-IT.md](UPGRADE-GP9-TO-GP10-IT.md).

@@ -1,25 +1,40 @@
 # WeeWX WMR200 Hardened Driver
 
-Advanced USB driver for **Oregon Scientific WMR200 / WMR200A** consoles, designed for WeeWX 4/5 and Raspberry Pi deployments.
+[![CI](https://github.com/pgpaolo/weewx-wmr200/actions/workflows/validate.yml/badge.svg)](https://github.com/pgpaolo/weewx-wmr200/actions/workflows/validate.yml)
+![Status](https://img.shields.io/badge/status-release%20candidate-orange)
+![Driver](https://img.shields.io/badge/driver-3.5.4--gp10-blue)
+![WeeWX](https://img.shields.io/badge/WeeWX-4%20%7C%205-4c8bf5)
+![Hardware](https://img.shields.io/badge/hardware-WMR200%20%7C%20WMR200A-lightgrey)
+
+Advanced USB driver for **Oregon Scientific WMR200 / WMR200A** consoles, with hardened USB handling, structured diagnostics, developer tracing and archive catch-up support for Raspberry Pi / Linux WeeWX deployments.
 
 > **Driver version:** `3.5.4-gp10-archive-clock-recovery`  
 > **Baseline:** `3.5.4-gp9-live-scheduler`  
-> **Status:** community project; not officially supported by the WeeWX project.
+> **Status:** release candidate / field validation  
+> **Support:** community project; not officially supported by the WeeWX project
+
+## Project lineage
+
+This repository is derived from the WMR200 driver maintained in the WeeWX community and preserves the original source attribution. The upstream historical repository is:
+
+- [weewx/weewx-wmr200](https://github.com/weewx/weewx-wmr200)
+
+The gp-series work focuses on USB resilience, diagnostics, stream recovery and safe archive catch-up while preserving the established WMR200 packet decoder and sensor mappings.
 
 ## Why gp10
 
-gp10 is a field-driven archive-recovery release. A real Raspberry Pi boot showed that WeeWX can start before networking/NTP has corrected the system clock. gp9 cached the first host/console drift and used wall-clock time inside startup recovery. A later NTP step could therefore terminate catch-up early and historical D2 records could be discarded or misclassified.
+`gp10` is a field-driven archive-recovery release. A real Raspberry Pi boot showed that WeeWX can start before networking/NTP has corrected the system clock. In that situation, a wall-clock step could terminate archive catch-up early and historical D2 records could later be rejected against the current database tail.
 
-gp10 keeps the validated gp9 live USB scheduler and adds a clock-safe archive state machine:
+`gp10` keeps the validated gp9 live USB scheduler and adds a clock-safe archive state machine:
 
-- startup recovery quiet timers use **`time.monotonic()` only**;
-- implausible first host/console drift samples are rejected;
+- startup recovery quiet timers use `time.monotonic()`;
+- implausible initial host/console drift samples are rejected;
 - the driver keeps sampling until the host clock becomes plausible;
-- after a configurable wait, recovery falls back to **native WMR200 timestamps** instead of applying a bogus multi-hour drift;
-- archive ordering is based on consecutive D2 records, never on the WeeWX database watermark;
+- after a configurable wait, recovery can fall back to native WMR200 timestamps instead of applying a bogus multi-hour drift;
+- archive ordering is based on consecutive D2 records, not on the WeeWX database watermark;
 - `since_ts` is used only as the catch-up boundary;
-- interrupted catch-up can resume from its original watermark using a small persistent state file;
-- historical D2 logger cadence can be auto-detected independently of the 60-second live WeeWX archive interval.
+- interrupted catch-up can resume from its original watermark using a persistent state file;
+- historical D2 cadence can be auto-detected independently of the normal live WeeWX archive interval.
 
 ## Preserved from gp9
 
@@ -29,9 +44,40 @@ gp10 keeps the validated gp9 live USB scheduler and adds a clock-safe archive st
 - checksum handling;
 - EPIPE / timeout recovery and controlled reopen;
 - malformed-HID stream resynchronization;
-- sensor mappings and packet decoder;
+- existing sensor mappings and packet decoder;
 - asynchronous rotating JSONL developer trace;
 - asynchronous rotating textual driver log.
+
+## Installation — WeeWX 5
+
+The repository is a standard WeeWX extension because it contains `install.py`. The official WeeWX 5 extension command is `weectl extension install EXTENSION-LOCATION`.
+
+### From a local clone
+
+```bash
+git clone https://github.com/pgpaolo/weewx-wmr200.git
+cd weewx-wmr200
+
+sudo weectl extension install .
+sudo weectl station reconfigure --driver=user.wmr200
+```
+
+Install the supplied udev rule once on Linux systems where the WeeWX service needs direct USB access:
+
+```bash
+sudo install -m 0644 util/udev/rules.d/wmr200.rules /etc/udev/rules.d/wmr200.rules
+sudo udevadm control --reload-rules
+```
+
+Then unplug/replug the WMR200 USB connection, or reboot the host, and restart WeeWX:
+
+```bash
+sudo systemctl restart weewx
+```
+
+> On installations where WeeWX is owned by the current user rather than root, `sudo` may not be required for the `weectl` commands.
+
+See the full Italian installation guide: [docs/INSTALLAZIONE-IT.md](docs/INSTALLAZIONE-IT.md).
 
 ## Recommended configuration
 
@@ -55,7 +101,7 @@ gp10 keeps the validated gp9 live USB scheduler and adds a clock-safe archive st
     archive_recovery_state_path = /var/lib/weewx/wmr200-archive-recovery.json
     archive_logger_interval = 0
 
-    # USB recovery / gp9 scheduler retained by gp10
+    # gp9 USB scheduler retained by gp10
     usb_write_retries = 3
     usb_read_retries = 2
     usb_retry_delay = 0.5
@@ -85,7 +131,7 @@ gp10 keeps the validated gp9 live USB scheduler and adds a clock-safe archive st
     [[sensor_map]]
 ```
 
-`archive_logger_interval = 0` means auto-detect the interval of historical D2 records. It does **not** change the driver's `archive_interval = 60` exposed to WeeWX for normal live archiving.
+`archive_logger_interval = 0` enables auto-detection of the cadence of historical D2 records. It does **not** change `archive_interval = 60` exposed to WeeWX for normal live archiving.
 
 ## Important gp10 trace events
 
@@ -98,29 +144,41 @@ gp10 keeps the validated gp9 live USB scheduler and adds a clock-safe archive st
 - `archive_recovery_start`
 - `archive_record_evaluated`
 - `archive_recovery_complete`
-- all gp9 USB scheduler events (`usb_poll_timeout`, `usb_read_timeout`, `heartbeat_sent`, etc.)
+- gp9 USB scheduler events such as `usb_poll_timeout`, `usb_read_timeout` and `heartbeat_sent`
 
-## Installation
+## Diagnostics
 
-```bash
-sudo ./install.sh
-```
+When reporting a problem, include the driver version, WeeWX version, host OS / Raspberry Pi model, WMR200/WMR200A model, the relevant `[WMR200]` configuration with secrets removed, and preferably a diagnostic bundle or the developer trace around the incident.
 
-or as a WeeWX extension:
+See:
 
-```bash
-sudo weectl extension install .
-sudo weectl station reconfigure --driver=user.wmr200
-```
+- [Developer trace](docs/DEVELOPER-TRACE.md)
+- [Developer trace — Italian](docs/DEVELOPER-TRACE-IT.md)
+- [Testing — Italian](docs/TESTING-IT.md)
+- [Archive recovery / NTP — Italian](docs/ARCHIVE-RECOVERY-NTP-IT.md)
 
-See `INSTALLAZIONE-IT.md` and `UPGRADE-GP9-TO-GP10-IT.md` for the complete procedure.
+## Upgrade and release notes
+
+- [gp9 → gp10 upgrade guide](docs/UPGRADE-GP9-TO-GP10-IT.md)
+- [gp10 release notes](docs/RELEASE-NOTES-GP10.md)
+- [Changelog](CHANGELOG.md)
 
 ## Safety
 
-Keep:
+During validation keep:
 
 ```ini
 erase_archive = False
 ```
 
-during validation. gp10 does not intentionally erase the console logger during normal catch-up.
+The driver does not intentionally erase the console logger during normal catch-up when this option is disabled.
+
+## Contributing
+
+Bug reports and hardware test results are welcome. Please use the GitHub issue templates so that USB, archive and clock information is collected consistently.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+For security-related reports, see [SECURITY.md](SECURITY.md). Do not publish credentials, private hostnames, API keys or complete configuration files containing secrets in public issues.
