@@ -1,0 +1,61 @@
+name: Validate
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main", "develop"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: Python syntax and metadata
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile driver
+        run: python -m py_compile bin/user/wmr200.py
+
+      - name: Compile extension installer
+        run: python -m py_compile install.py
+
+      - name: Check gp10 version metadata
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          version = "3.5.4-gp10-archive-clock-recovery"
+          files = [
+              Path("bin/user/wmr200.py"),
+              Path("install.py"),
+              Path("README.md"),
+          ]
+
+          missing = [
+              str(p)
+              for p in files
+              if version not in p.read_text(encoding="utf-8")
+          ]
+
+          if missing:
+              raise SystemExit(
+                  "Version string missing from: " + ", ".join(missing)
+              )
+
+          print("Version metadata consistent:", version)
+          PY
